@@ -92,6 +92,58 @@ return 0;
 }}
 """
 
+        # c_callable mode (P1): kernel wrapper exposes
+        #   extern "C" int triton_<func_name>(typed* ptr args, scalar args)
+        # instead of main(). Tensors are wrapped in-place over the typed pointer
+        # args, scalars are used directly (no literal redeclaration). Enables
+        # direct dlopen+dlsym integration from host code (ExecuTorch, llama.cpp,
+        # etc.) without the hex-pointer argv shim.
+        #
+        # Tensor scalar arg counterparts (one per scalar input):
+        #   "int S0"  /  "float S1" / ...
+        self.c_callable_input_tensor_arg_template = (
+            "const {tensor_ctype}* {input_tensor_prefix}{idx}_ptr"
+        )
+        self.c_callable_input_tensor_arg_template_rank_0 = (
+            "{tensor_ctype}* {input_tensor_prefix}{idx}_ptr"
+        )
+        self.c_callable_scalar_arg_template = (
+            "{scalar_ctype} {scalar_prefix}{idx}"
+        )
+
+        # Signature template — {c_arg_list} is the joined args, "triton_" prefix
+        # is fixed to match the documented ABI.
+        self.c_callable_signature_template = (
+            'extern "C" int triton_{func_name}({c_arg_list})'
+        )
+
+        # In-body wrap: ranked input tensor uses const_cast on the const* arg
+        # (Tensor's mutable buffer ctor takes T*, so we strip const at the call
+        # site rather than weakening the ABI signature). `sizes`/`strides` are
+        # already brace-wrapped initializer-list literals from utils.get_shape().
+        self.c_callable_tensor_wrap_string = """
+    Tensor<{tensor_ctype}, {tensor_rank}> {input_tensor_prefix}{idx}(const_cast<{tensor_ctype}*>({input_tensor_prefix}{idx}_ptr), {sizes}, {strides});
+    MemRefDescriptor<{tensor_ctype}, {tensor_rank}> *{memrefdesc_name}{idx} = {input_tensor_prefix}{idx}.toMemRefDesc();
+"""
+        # Rank-0 tensor: no shape, no const_cast (the arg is T*, not const T*).
+        self.c_callable_tensor_wrap_string_rank_0 = """
+    Tensor<{tensor_ctype}, 0> {input_tensor_prefix}{idx};
+    MemRefDescriptor<{tensor_ctype}, 0> *{memrefdesc_name}{idx} = {input_tensor_prefix}{idx}.toMemRefDesc();
+"""
+
+        # c_callable body: same shape as argv body but the entry point is the
+        # signature instead of main(argc, argv).
+        self.code_body_c_callable = """
+{c_signature} {{
+{tensor_definition_str}
+{input_wrapper_structs_init}
+{result_struct_init}
+{benchmarking_and_reporting}
+{update_tensor}
+return 0;
+}}
+"""
+
         self.func_call_and_benchmarking = """
 uint64_t avg_time_us = benchmark_time_us({iterations}, [&]() {{
     {function_call}
@@ -412,6 +464,86 @@ class HexagonWrapperGenerator:
                 formatted_tensor_string += scalar_declaration
         return formatted_tensor_string
 
+    def generate_c_callable_signature(self):
+        """
+        c_callable mode (P1): emit the extern "C" function signature.
+
+        Each ranked tensor input becomes a typed pointer arg
+        (const T* for inputs, T* for rank-0). Each scalar becomes a typed
+        scalar arg using the same `S{idx}` naming convention used elsewhere
+        in this codegen (see generate_thread_pool_setup, scalar_init_template).
+        Function name is `triton_<func_name>` to match the documented ABI.
+        """
+        args = []
+        for inp in self.input_profs:
+            if inp.input_type == "tensor":
+                if inp.rank == 0:
+                    args.append(
+                        self.common_strings.c_callable_input_tensor_arg_template_rank_0.format(
+                            tensor_ctype=inp.dtype,
+                            idx=inp.idx,
+                            input_tensor_prefix=self.common_strings.input_tensor_name,
+                        )
+                    )
+                else:
+                    args.append(
+                        self.common_strings.c_callable_input_tensor_arg_template.format(
+                            tensor_ctype=inp.dtype,
+                            idx=inp.idx,
+                            input_tensor_prefix=self.common_strings.input_tensor_name,
+                        )
+                    )
+            else:
+                args.append(
+                    self.common_strings.c_callable_scalar_arg_template.format(
+                        scalar_ctype=inp.dtype,
+                        scalar_prefix=self.common_strings.scalar_name,
+                        idx=inp.idx,
+                    )
+                )
+        c_arg_list = ", ".join(args)
+        return self.common_strings.c_callable_signature_template.format(
+            func_name=self.func_name, c_arg_list=c_arg_list
+        )
+
+    def generate_input_declarations_c_callable(self):
+        """
+        c_callable mode (P1): wrap typed pointer args into Tensor<T,R> views.
+
+        Same Triton-only contract as argv mode: the kernel signature carries
+        output pointers as inputs, so iterating self.input_profs covers all
+        outputs too. Scalars are pulled directly from the function signature
+        (no body declaration needed).
+        """
+        formatted_tensor_string = ""
+        for inp in self.input_profs:
+            if inp.input_type != "tensor":
+                # Scalars are function parameters; nothing to emit in the body.
+                continue
+            if inp.rank == 0:
+                tensor_declaration = (
+                    self.common_strings.c_callable_tensor_wrap_string_rank_0.format(
+                        tensor_ctype=inp.dtype,
+                        idx=inp.idx,
+                        memrefdesc_name=self.common_strings.memrefdesc_name,
+                        input_tensor_prefix=self.common_strings.input_tensor_name,
+                    ).lstrip()
+                )
+            else:
+                tensor_declaration = (
+                    self.common_strings.c_callable_tensor_wrap_string.format(
+                        tensor_ctype=inp.dtype,
+                        tensor_rank=inp.rank,
+                        idx=inp.idx,
+                        sizes=inp.shape[0],
+                        strides=inp.shape[1],
+                        memrefdesc_name=self.common_strings.memrefdesc_name,
+                        input_tensor_prefix=self.common_strings.input_tensor_name,
+                    ).lstrip()
+                )
+            formatted_tensor_string += tensor_declaration
+        return formatted_tensor_string
+
     def generate_cpp_code_headers(self) -> str:
         code_headers = self.common_strings.code_headers
         return code_headers
@@ -456,6 +588,20 @@ class HexagonWrapperGenerator:
         )
         return code_body
 
+    def generate_cpp_code_body_c_callable(self) -> str:
+        """c_callable mode (P1): extern "C" wrapper body — no main, no file I/O."""
+        code_body = self.common_strings.code_body_c_callable.format(
+            c_signature=self.generate_c_callable_signature(),
+            tensor_definition_str=self.generate_input_declarations_c_callable(),
+            input_wrapper_structs_init=self.generate_input_wrapper_structs_init(),
+            result_struct_init=self.generate_result_struct_init(),
+            benchmarking_and_reporting=self.generate_benchmarking_and_reporting(
+                self.generate_llvm_function_call()
+            ),
+            update_tensor=self.generate_update_tensor_calls(),
+        )
+        return code_body
+
     def generate_cpp_wrapper(self, file_name, exec_dir) -> str:
         """
         Generates skeleton cpp file which calls a function.
@@ -475,6 +621,19 @@ class HexagonWrapperGenerator:
                     "FuncResult output path is not supported in argv mode."
                 )
             code_body = HexagonWrapperGenerator.generate_cpp_code_body_argv(self)
+        elif self.io_mode == "c_callable":
+            # P1 c_callable contract: same Triton convention as argv mode —
+            # outputs must be carried as input pointers (the wrapper signature
+            # has no slot for FuncResult-style return values). Reject non-empty
+            # output_profs upstream to give a clearer error than a templating
+            # failure deep in codegen.
+            if len(self.output_profs) > 0:
+                raise NotImplementedError(
+                    "io_mode='c_callable' currently requires the kernel signature to "
+                    "include output pointers as inputs (Triton convention). The "
+                    "non-Triton FuncResult output path is not supported in c_callable mode."
+                )
+            code_body = HexagonWrapperGenerator.generate_cpp_code_body_c_callable(self)
         else:
             code_body = HexagonWrapperGenerator.generate_cpp_code_body(
                 self, file_name, exec_dir

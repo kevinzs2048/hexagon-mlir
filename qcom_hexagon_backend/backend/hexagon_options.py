@@ -87,10 +87,13 @@ class HexagonOptions:
     # Increasing LWPloopDepth may cause overhead.
     LWPloopDepth: int = 1
 
-    # Wrapper I/O mode (Phase 1d):
-    #   "file" - generated main() loads inputs / dumps outputs via .raw files (existing behavior).
-    #   "argv" - generated main(argc, argv) decodes hex-encoded pointers from argv[1..N]
-    #            into Tensor views over externally-owned buffers; no file I/O is emitted.
+    # Wrapper I/O mode (Phase 1d + P1):
+    #   "file"       - generated main() loads inputs / dumps outputs via .raw files (existing behavior).
+    #   "argv"       - generated main(argc, argv) decodes hex-encoded pointers from argv[1..N]
+    #                  into Tensor views over externally-owned buffers; no file I/O is emitted.
+    #   "c_callable" - (P1) generated wrapper is an extern "C" function with typed pointer/scalar
+    #                  args instead of main(). Enables direct dlopen+dlsym integration without
+    #                  the hex-pointer argv shim.
     io_mode: str = "file"
 
     def __post_init__(self):
@@ -102,7 +105,7 @@ class HexagonOptions:
                 f"Must be one of: {', '.join(sorted(valid_artifacts))}"
             )
         # Validate io_mode
-        valid_io_modes = {"file", "argv"}
+        valid_io_modes = {"file", "argv", "c_callable"}
         if self.io_mode not in valid_io_modes:
             raise ValueError(
                 f"Invalid io_mode '{self.io_mode}'. "

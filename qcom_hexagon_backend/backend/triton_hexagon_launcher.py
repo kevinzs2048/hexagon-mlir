@@ -130,6 +130,18 @@ return 0;
 }}
 """
 
+        # c_callable-mode multithreaded Triton wrapper (P1): typed-arg
+        # extern "C" function in place of main(); still uses thread pool.
+        self.triton_code_body_c_callable = """
+{c_signature} {{
+{tensor_definition_str}
+{setup_thread_pool}
+{benchmarking_and_reporting}
+{update_tensor}
+return 0;
+}}
+"""
+
 
 """
     Wrapper generator that contains the Triton related codegen utilities used to generate the CPP launcher.
@@ -363,6 +375,19 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
         )
         return code_body
 
+    def generate_cpp_code_body_c_callable(self) -> str:
+        """c_callable-mode multithreaded Triton wrapper: thread pool + no file I/O."""
+        code_body = self.common_strings.triton_code_body_c_callable.format(
+            c_signature=self.generate_c_callable_signature(),
+            tensor_definition_str=self.generate_input_declarations_c_callable(),
+            benchmarking_and_reporting=self.generate_benchmarking_and_reporting(
+                self.generate_thread_pool_exec()
+            ),
+            update_tensor=self.generate_update_tensor_calls(),
+            setup_thread_pool=self.generate_thread_pool_setup(),
+        )
+        return code_body
+
     def generate_cpp_wrapper(self, file_name, exec_dir):
         """
         Generates skeleton cpp file which launches triton kernel.
@@ -382,6 +407,18 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
                         "FuncResult output path is not supported in argv mode."
                     )
                 code_body = self.generate_cpp_code_body_argv()
+            elif self.io_mode == "c_callable":
+                # P1 c_callable contract: same Triton convention as argv mode.
+                # The wrapper signature has no slot for FuncResult-style returns,
+                # so non-empty output_profs is rejected. Mirrors the base-class
+                # guard for consistency in error messaging.
+                if len(self.output_profs) > 0:
+                    raise NotImplementedError(
+                        "io_mode='c_callable' currently requires the kernel signature to "
+                        "include output pointers as inputs (Triton convention). The "
+                        "non-Triton FuncResult output path is not supported in c_callable mode."
+                    )
+                code_body = self.generate_cpp_code_body_c_callable()
             else:
                 code_body = self.generate_cpp_code_body(file_name, exec_dir)
             return self.common_strings.code_string.format(
