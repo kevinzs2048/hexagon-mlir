@@ -63,6 +63,35 @@ struct FuncResult
         self.dump_to_file_string = """{output_tensor_prefix}{idx}.dump_to_file("{path}/{file_name}_o{idx}.raw");\n"""
         self.call_lwp = """WriteLWPOutput("{path}/{fname}.json");\n"""
 
+        # argv mode (Phase 1d): kernel main accepts (argc, argv) with argv[1..N] =
+        # hex-encoded pointers into externally-owned (typically ION-mapped) buffers.
+        # Each tensor is constructed in-place via the pointer-wrap Tensor ctor.
+        # `{{sizes}}` / `{{strides}}` are already brace-wrapped initializer-list
+        # literals (e.g. "{4, 8}") produced by utils.get_shape(), so we emit them
+        # with single braces here.
+        self.argv_tensor_decode_string = """
+    Tensor<{tensor_ctype}, {tensor_rank}> {input_tensor_prefix}{idx}(reinterpret_cast<{tensor_ctype}*>(strtoull(argv[{argv_idx}], nullptr, 16)), {sizes}, {strides});
+    MemRefDescriptor<{tensor_ctype}, {tensor_rank}> *{memrefdesc_name}{idx} = {input_tensor_prefix}{idx}.toMemRefDesc();
+"""
+        # argv mode rank-0 tensor: not addressable via argv pointer (no shape);
+        # fall back to default-construct (allocates 1 element on heap).
+        self.argv_tensor_decode_string_rank_0 = """
+    Tensor<{tensor_ctype}, 0> {input_tensor_prefix}{idx};
+    MemRefDescriptor<{tensor_ctype}, 0> *{memrefdesc_name}{idx} = {input_tensor_prefix}{idx}.toMemRefDesc();
+"""
+
+        # argv mode main(): no read_from_file / write_to_file / lwp.
+        self.code_body_argv = """
+int main(int argc, char* argv[]) {{
+{tensor_definition_str}
+{input_wrapper_structs_init}
+{result_struct_init}
+{benchmarking_and_reporting}
+{update_tensor}
+return 0;
+}}
+"""
+
         self.func_call_and_benchmarking = """
 uint64_t avg_time_us = benchmark_time_us({iterations}, [&]() {{
     {function_call}
@@ -137,6 +166,8 @@ class HexagonWrapperGenerator:
         self.output_profs = output_profs
         self.common_strings = common_strings
         self.enable_lwp = options["enableLWP"]
+        # Phase 1d: select file (default) vs argv-mode codegen for the kernel main.
+        self.io_mode = options.get("io_mode", "file") if isinstance(options, dict) else getattr(options, "io_mode", "file")
 
     def generate_input_declarations(self):
         """
@@ -326,6 +357,53 @@ class HexagonWrapperGenerator:
                 )
         return write_to_file_string
 
+    def generate_input_declarations_argv(self):
+        """
+        argv mode (Phase 1d): emit Tensor declarations that wrap externally-owned
+        pointers decoded from argv. argv[0] is the executable name; argv[1..N]
+        carry one hex-encoded pointer per ranked tensor input (then ranked
+        outputs, if any). Scalars and rank-0 tensors fall back to literal /
+        default construction (no argv slot consumed).
+        """
+        formatted_tensor_string = ""
+        argv_idx = 1  # argv[0] is the executable path
+        for inp in self.input_profs:
+            if inp.input_type == "tensor":
+                if inp.rank == 0:
+                    tensor_declaration = (
+                        self.common_strings.argv_tensor_decode_string_rank_0.format(
+                            tensor_ctype=inp.dtype,
+                            idx=inp.idx,
+                            memrefdesc_name=self.common_strings.memrefdesc_name,
+                            input_tensor_prefix=self.common_strings.input_tensor_name,
+                        ).lstrip()
+                    )
+                else:
+                    tensor_declaration = (
+                        self.common_strings.argv_tensor_decode_string.format(
+                            tensor_ctype=inp.dtype,
+                            tensor_rank=inp.rank,
+                            idx=inp.idx,
+                            sizes=inp.shape[0],
+                            strides=inp.shape[1],
+                            memrefdesc_name=self.common_strings.memrefdesc_name,
+                            input_tensor_prefix=self.common_strings.input_tensor_name,
+                            argv_idx=argv_idx,
+                        ).lstrip()
+                    )
+                    argv_idx += 1
+                formatted_tensor_string += tensor_declaration
+            else:
+                # Scalars: keep file-mode literal init (no argv slot consumed).
+                scalar_declaration = self.common_strings.scalar_init_template.format(
+                    i=inp.idx,
+                    scalar_ctype=inp.dtype,
+                    scalar_val=inp.value,
+                    scalar_prefix=self.common_strings.scalar_name,
+                ).lstrip()
+                formatted_tensor_string += scalar_declaration
+        return formatted_tensor_string
+
     def generate_cpp_code_headers(self) -> str:
         code_headers = self.common_strings.code_headers
         return code_headers
@@ -357,15 +435,31 @@ class HexagonWrapperGenerator:
         )
         return code_body
 
+    def generate_cpp_code_body_argv(self) -> str:
+        """argv-mode main body: no file I/O, no lwp dump."""
+        code_body = self.common_strings.code_body_argv.format(
+            tensor_definition_str=self.generate_input_declarations_argv(),
+            input_wrapper_structs_init=self.generate_input_wrapper_structs_init(),
+            result_struct_init=self.generate_result_struct_init(),
+            benchmarking_and_reporting=self.generate_benchmarking_and_reporting(
+                self.generate_llvm_function_call()
+            ),
+            update_tensor=self.generate_update_tensor_calls(),
+        )
+        return code_body
+
     def generate_cpp_wrapper(self, file_name, exec_dir) -> str:
         """
         Generates skeleton cpp file which calls a function.
         """
         code_headers = HexagonWrapperGenerator.generate_cpp_code_headers(self)
         code_define = HexagonWrapperGenerator.generate_cpp_code_define(self)
-        code_body = HexagonWrapperGenerator.generate_cpp_code_body(
-            self, file_name, exec_dir
-        )
+        if self.io_mode == "argv":
+            code_body = HexagonWrapperGenerator.generate_cpp_code_body_argv(self)
+        else:
+            code_body = HexagonWrapperGenerator.generate_cpp_code_body(
+                self, file_name, exec_dir
+            )
 
         return self.common_strings.code_string.format(
             code_headers=code_headers, code_define=code_define, code_body=code_body
@@ -429,8 +523,17 @@ class HexagonLauncherBase:
                 i = inp.idx
                 data = inp.value
                 input_path = os.path.join(directory, f"{file_name}_t{i}.raw")
+                # Accept torch.Tensor or FlagGems StridedBuffer (duck-typed).
+                if hasattr(data, "numpy"):
+                    raw_bytes = data.numpy().tobytes()
+                elif hasattr(data, "_base"):
+                    raw_bytes = data._base.detach().cpu().numpy().tobytes()
+                else:
+                    raise TypeError(
+                        f"cannot serialize input of type {type(data).__name__}"
+                    )
                 with open(input_path, "wb") as file:
-                    file.write(data.numpy().tobytes())
+                    file.write(raw_bytes)
                 input_paths.append(input_path)
 
         # The output path count is provided by the frontend. There are

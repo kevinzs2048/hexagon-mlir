@@ -188,6 +188,17 @@ public:
     setupDesc(buf_pair.first, buf_pair.second, 0);
   }
 
+  // Wrap an existing externally-owned aligned buffer (no ownership transfer).
+  // Used by argv-mode generated wrappers (Phase 1d): the kernel main receives
+  // hex-encoded ION buffer pointers via argv and constructs Tensor views over
+  // them. Destructor must NOT free these buffers (needsAlloc=false).
+  template <int M = N, std::enable_if_t<M != 0, int> = 0>
+  Tensor(T *aligned, const int64_t (&sizes_in)[N],
+         const int64_t (&strides_in)[N])
+      : mem(MemType::HEAP), needsAlloc(false), alignment(0) {
+    setupDesc(aligned, aligned, 0, sizes_in, strides_in);
+  }
+
   MemRefDescriptor<T, N> *toMemRefDesc() { return &memRefDesc; }
 
   int64_t getElementsCount() {

@@ -64,8 +64,12 @@ def getHexagonLauncherClass(device_type="dsp"):
                     your_kernel[(1,)](...)
                     """
                 )
+            # Phase 1d: forward `io_mode` (and any other future option-style)
+            # kwargs from the kernel launch site through to _exec_kernel so the
+            # wrapper codegen can switch between file and argv modes.
             self.launcher._exec_kernel(
-                kernel_llir, iterations, func_name, inputs, return_profs, launch_grid
+                kernel_llir, iterations, func_name, inputs, return_profs, launch_grid,
+                io_mode=kwargs.get("io_mode", "file"),
             )
             # TODO: There seems to be no way to propogate the call returns upward, because
             #    - The call result is not used by the caller

@@ -118,6 +118,18 @@ return 0;
 }}
 """
 
+        # argv-mode Triton main (Phase 1d): tensors are decoded from argv hex
+        # pointers; no file I/O. Multithreaded kernels still use the thread pool.
+        self.triton_code_body_argv = """
+int main(int argc, char* argv[]) {{
+{tensor_definition_str}
+{setup_thread_pool}
+{benchmarking_and_reporting}
+{update_tensor}
+return 0;
+}}
+"""
+
 
 """
     Wrapper generator that contains the Triton related codegen utilities used to generate the CPP launcher.
@@ -339,6 +351,18 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
         )
         return code_body
 
+    def generate_cpp_code_body_argv(self) -> str:
+        """argv-mode multithreaded Triton main: thread pool + no file I/O."""
+        code_body = self.common_strings.triton_code_body_argv.format(
+            tensor_definition_str=self.generate_input_declarations_argv(),
+            benchmarking_and_reporting=self.generate_benchmarking_and_reporting(
+                self.generate_thread_pool_exec()
+            ),
+            update_tensor=self.generate_update_tensor_calls(),
+            setup_thread_pool=self.generate_thread_pool_setup(),
+        )
+        return code_body
+
     def generate_cpp_wrapper(self, file_name, exec_dir):
         """
         Generates skeleton cpp file which launches triton kernel.
@@ -346,7 +370,10 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
         if self.multithreading_enabled:
             code_headers = self.generate_cpp_code_headers()
             code_define = self.generate_cpp_code_define()
-            code_body = self.generate_cpp_code_body(file_name, exec_dir)
+            if self.io_mode == "argv":
+                code_body = self.generate_cpp_code_body_argv()
+            else:
+                code_body = self.generate_cpp_code_body(file_name, exec_dir)
             return self.common_strings.code_string.format(
                 code_headers=code_headers, code_define=code_define, code_body=code_body
             )
@@ -363,6 +390,7 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         inputs: list[Tensor],
         output_profs: list,
         launch_grid: tuple,
+        io_mode: str = "file",
     ) -> list[Tensor]:
         # Getting the input metadata for effective wrapper codegen.
         input_profs = profile_triton_inputs(inputs)
@@ -378,6 +406,8 @@ class TritonHexagonLauncher(HexagonLauncherBase):
 
         # Get HexagonOptions at this point for triton pipeline.
         options = HexagonOptions().__dict__
+        # Phase 1d: surface io_mode from the launch kwargs (defaults to "file").
+        options["io_mode"] = io_mode
 
         # Pass lwp related info to HexagonExecutor() for creating shared obj and pulling lwp.json file if enabled.
         hexec = HexagonExecutor(options["enableLWP"])
