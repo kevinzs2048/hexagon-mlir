@@ -41,7 +41,13 @@ class HexagonExecutor:
                                  calling the `get_config` method.
         """
         self.exec_mode = get_exec_mode() if not compile_only else "compile_only"
-        self.device_path = "/vendor/bin"
+        # Stock images on this board mount /vendor read-only; honor an env
+        # override so the Path A launcher can stage under /data/local/tmp.
+        self.device_path = os.environ.get("HEXAGON_REMOTE_BIN_DIR", "/vendor/bin")
+        # rfsa adsp dir for the run_main_on_hexagon skel — also read-only on
+        # stock images. ADSP_LIBRARY_PATH must point at the override so
+        # FastRPC can find the skel.
+        self.rfsa_path = os.environ.get("HEXAGON_REMOTE_RFSA", "/vendor/lib/rfsa/adsp")
         self.config = self.get_config()
         self.enable_lwp = enable_lwp
         self.enable_etm = enable_etm  # When set to True, etm traces will be collected and processed with pyetm.
@@ -448,19 +454,21 @@ class HexagonExecutor:
             ),
             # Push run_main_on_hexagon skel library
             (
-                "adb {} -s {} push {} /vendor/lib/rfsa/adsp".format(
+                "adb {} -s {} push {} {}".format(
                     self.config.env_vars["ANDROID_HOST"],
                     self.config.env_vars["ANDROID_SERIAL"],
                     librun_main_on_hexagon_skel_path,
+                    self.rfsa_path,
                 ),
                 True,
             ),
             # Push libc++.so.1 library specific to hexagon-tools and Q6 version
             (
-                "adb {} -s {} push {} /vendor/lib/rfsa/adsp".format(
+                "adb {} -s {} push {} {}".format(
                     self.config.env_vars["ANDROID_HOST"],
                     self.config.env_vars["ANDROID_SERIAL"],
                     libcpp_path,
+                    self.rfsa_path,
                 ),
                 True,
             ),
@@ -476,12 +484,17 @@ class HexagonExecutor:
                 ),
                 self.enable_etm,
             ),
-            # Run the kernel using run_main_on_hexagon
+            # Run the kernel using run_main_on_hexagon. ADSP_LIBRARY_PATH lets
+            # FastRPC find the skel when it lives under our override dir.
             (
-                "adb {} -s {} shell 'cd {}; touch /vendor/lib/rfsa/adsp/run_main_on_hexagon.farf; ./run_main_on_hexagon 3 {}'".format(
+                "adb {} -s {} shell 'cd {}; touch {}/run_main_on_hexagon.farf; "
+                "ADSP_LIBRARY_PATH={}:/vendor/lib/rfsa/adsp:/dsp "
+                "./run_main_on_hexagon 3 {}'".format(
                     self.config.env_vars["ANDROID_HOST"],
                     self.config.env_vars["ANDROID_SERIAL"],
                     self.device_path,
+                    self.rfsa_path,
+                    self.rfsa_path,
                     path_to_principal_lib_on_device,
                 ),
                 True,
