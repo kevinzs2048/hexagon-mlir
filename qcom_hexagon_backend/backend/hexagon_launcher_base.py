@@ -361,9 +361,17 @@ class HexagonWrapperGenerator:
         """
         argv mode (Phase 1d): emit Tensor declarations that wrap externally-owned
         pointers decoded from argv. argv[0] is the executable name; argv[1..N]
-        carry one hex-encoded pointer per ranked tensor input (then ranked
-        outputs, if any). Scalars and rank-0 tensors fall back to literal /
-        default construction (no argv slot consumed).
+        carry one hex-encoded pointer per ranked tensor input.
+
+        Triton-only contract: in the Triton frontend the kernel signature
+        includes output pointers as inputs (the kernel mutates outputs
+        in-place through those input pointers), so iterating self.input_profs
+        also covers all outputs. Non-Triton frontends (e.g. torch-mlir) return
+        outputs via the FuncResult struct, which is process-local memory and
+        not addressable from the caller's ION buffer. argv mode therefore
+        rejects non-empty output_profs upstream (see generate_cpp_wrapper).
+        Scalars and rank-0 tensors fall back to literal / default construction
+        (no argv slot consumed).
         """
         formatted_tensor_string = ""
         argv_idx = 1  # argv[0] is the executable path
@@ -455,6 +463,17 @@ class HexagonWrapperGenerator:
         code_headers = HexagonWrapperGenerator.generate_cpp_code_headers(self)
         code_define = HexagonWrapperGenerator.generate_cpp_code_define(self)
         if self.io_mode == "argv":
+            # Phase 1d argv contract: argv slots cover ranked tensor inputs
+            # only. The kernel must mutate output buffers in-place through
+            # input pointers (Triton convention). Frontends that route outputs
+            # through a FuncResult struct land results in process-local memory
+            # rather than the caller's ION buffer, so reject them here.
+            if len(self.output_profs) > 0:
+                raise NotImplementedError(
+                    "io_mode='argv' currently requires the kernel signature to include "
+                    "output pointers as inputs (Triton convention). The non-Triton "
+                    "FuncResult output path is not supported in argv mode."
+                )
             code_body = HexagonWrapperGenerator.generate_cpp_code_body_argv(self)
         else:
             code_body = HexagonWrapperGenerator.generate_cpp_code_body(

@@ -14,6 +14,7 @@ from triton.backends.qcom_hexagon_backend.triton_hexagon_launcher import (
     TritonHexagonLauncher,
     HexagonUtils,
 )
+from triton.backends.qcom_hexagon_backend.hexagon_options import HexagonOptions
 from triton.backends.qcom_hexagon_backend.utils import make_profiled_return
 
 
@@ -66,10 +67,14 @@ def getHexagonLauncherClass(device_type="dsp"):
                 )
             # Phase 1d: forward `io_mode` (and any other future option-style)
             # kwargs from the kernel launch site through to _exec_kernel so the
-            # wrapper codegen can switch between file and argv modes.
+            # wrapper codegen can switch between file and argv modes. Construct
+            # HexagonOptions to invoke __post_init__ validation at the launch
+            # site so bogus io_mode values raise here rather than silently
+            # falling through to file mode in the codegen branch.
+            io_mode = HexagonOptions(io_mode=kwargs.get("io_mode", "file")).io_mode
             self.launcher._exec_kernel(
                 kernel_llir, iterations, func_name, inputs, return_profs, launch_grid,
-                io_mode=kwargs.get("io_mode", "file"),
+                io_mode=io_mode,
             )
             # TODO: There seems to be no way to propogate the call returns upward, because
             #    - The call result is not used by the caller

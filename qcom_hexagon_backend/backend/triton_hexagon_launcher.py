@@ -371,6 +371,16 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
             code_headers = self.generate_cpp_code_headers()
             code_define = self.generate_cpp_code_define()
             if self.io_mode == "argv":
+                # Phase 1d argv contract: argv slots only cover ranked tensor
+                # inputs. Triton kernels carry outputs as input pointers, so
+                # output_profs should be empty here. Enforce explicitly to
+                # mirror the base-class guard.
+                if len(self.output_profs) > 0:
+                    raise NotImplementedError(
+                        "io_mode='argv' currently requires the kernel signature to include "
+                        "output pointers as inputs (Triton convention). The non-Triton "
+                        "FuncResult output path is not supported in argv mode."
+                    )
                 code_body = self.generate_cpp_code_body_argv()
             else:
                 code_body = self.generate_cpp_code_body(file_name, exec_dir)
@@ -405,9 +415,11 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         print(f"==> kernel obj saved in: {obj_src_path}")
 
         # Get HexagonOptions at this point for triton pipeline.
-        options = HexagonOptions().__dict__
-        # Phase 1d: surface io_mode from the launch kwargs (defaults to "file").
-        options["io_mode"] = io_mode
+        # Phase 1d: route io_mode through the HexagonOptions constructor so
+        # __post_init__ validation runs on the runtime path. Mutating the
+        # __dict__ post-hoc would bypass the validator and let bogus values
+        # silently fall through to file mode in the codegen branch.
+        options = HexagonOptions(io_mode=io_mode).__dict__
 
         # Pass lwp related info to HexagonExecutor() for creating shared obj and pulling lwp.json file if enabled.
         hexec = HexagonExecutor(options["enableLWP"])
