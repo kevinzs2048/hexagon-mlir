@@ -30,6 +30,12 @@ def getHexagonLauncherClass(device_type="dsp"):
                 cst_key(key): value for key, value in src.signature.items()
             }
             self.launcher = TritonHexagonLauncher()
+            # Phase 1d: cache metadata so __call__ can read option-style fields
+            # (e.g. io_mode). Triton's runtime calls __call__ with no kwargs —
+            # all HexagonOptions fields are baked into the per-kernel metadata
+            # via compiler.parse_options() at compile time, not forwarded on
+            # the launch path.
+            self.metadata = metadata
             pass
 
         def __call__(self, *args, **kwargs):
@@ -66,12 +72,18 @@ def getHexagonLauncherClass(device_type="dsp"):
                     """
                 )
             # Phase 1d: forward `io_mode` (and any other future option-style)
-            # kwargs from the kernel launch site through to _exec_kernel so the
-            # wrapper codegen can switch between file and argv modes. Construct
-            # HexagonOptions to invoke __post_init__ validation at the launch
-            # site so bogus io_mode values raise here rather than silently
-            # falling through to file mode in the codegen branch.
-            io_mode = HexagonOptions(io_mode=kwargs.get("io_mode", "file")).io_mode
+            # field from the per-kernel metadata through to _exec_kernel so the
+            # wrapper codegen can switch between file and argv modes. Triton's
+            # runtime doesn't forward **kwargs on the launch path — option-style
+            # fields are baked into KernelMetadata via compiler.parse_options()
+            # at compile time. Fall back to kwargs for callers that bypass the
+            # triton compiler cache and call __call__ directly. Construct
+            # HexagonOptions to invoke __post_init__ validation so bogus
+            # io_mode values raise here rather than silently falling through.
+            io_mode_raw = kwargs.get(
+                "io_mode", getattr(self.metadata, "io_mode", "file")
+            )
+            io_mode = HexagonOptions(io_mode=io_mode_raw).io_mode
             self.launcher._exec_kernel(
                 kernel_llir, iterations, func_name, inputs, return_profs, launch_grid,
                 io_mode=io_mode,
