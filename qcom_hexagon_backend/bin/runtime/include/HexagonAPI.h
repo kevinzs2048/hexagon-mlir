@@ -25,6 +25,7 @@
 
 #include "BufferManager.h"
 #include "HexagonCommon.h"
+#include "HexagonRuntimeShared.h"
 #include "VTCMPool.h"
 
 /// Hexagon Device API that is compiled and run on Hexagon.
@@ -33,8 +34,20 @@ public:
   /// Retrieve the global singleton instance of the HexagonAPI.
   static HexagonAPI *Global();
 
-  /// Constructor
-  HexagonAPI() { this->AcquireResources(); }
+  /// Constructor. Lazily dispatches between standalone mode (acquire our own
+  /// VTCM + HMX) and shared mode (use externally-registered VTCM, caller owns
+  /// HMX) based on whether a host runtime called
+  /// hexmlir_register_external_resources before the first kernel invocation.
+  HexagonAPI() {
+    void *ext_vtcm = nullptr;
+    size_t ext_size = 0;
+    if (hexmlir_internal::commit_and_get_external_resources(&ext_vtcm,
+                                                            &ext_size)) {
+      this->AcquireResourcesShared(ext_vtcm, ext_size);
+    } else {
+      this->AcquireResources();
+    }
+  }
 
   /// Destructor
   ~HexagonAPI() { this->ReleaseResources(); }
@@ -48,6 +61,26 @@ public:
     bufferManager = std::make_unique<BufferManager>();
 
     hmx_context_id = initialize_and_acquire_hmx();
+    shared_mode_ = false;
+  }
+
+  /// Shared-mode acquisition (P3.6 / external-resources): use the
+  /// caller-provided VTCM region and skip HMX initialization (the caller has
+  /// already acquired/powered HMX). The VtcmPool dtor will not release the
+  /// region; this object will not release HMX.
+  void AcquireResourcesShared(void *vtcm_ptr, size_t vtcm_size) {
+    CHECK_EQ(runtimeVtcm, nullptr);
+    runtimeVtcm = std::make_unique<VtcmPool>(vtcm_ptr, vtcm_size);
+
+    CHECK_EQ(bufferManager, nullptr);
+    bufferManager = std::make_unique<BufferManager>();
+
+    // P3.6 Task 7 experiment: external VTCM, but let the kernel self-manage HMX
+    // (acquire its own HMX context + per-thread lock) so it can run directly on
+    // the caller's dispatch thread without routing through an HMX-locked worker
+    // thread. The kernel's HMX lock is on whatever thread first invokes it.
+    hmx_context_id = initialize_and_acquire_hmx();
+    shared_mode_ = true;
   }
 
   /// Ensures all runtime resources are freed
@@ -58,7 +91,9 @@ public:
     CHECK((runtimeVtcm), "runtimeVtcm was not created in AcquireResources");
     runtimeVtcm.reset();
 
-    release_hmx();
+    if (!shared_mode_) {
+      release_hmx();
+    }
   }
 
   /// Returns VtcmPool instance
@@ -98,6 +133,10 @@ private:
 
   /// VTCM memory manager
   std::unique_ptr<VtcmPool> runtimeVtcm;
+
+  /// True when running in shared (external-resources) mode. Gates HMX release
+  /// and VTCM ownership in ReleaseResources / VtcmPool dtor.
+  bool shared_mode_ = false;
 
   /// HMX Context
   uint32_t hmx_context_id = 0;

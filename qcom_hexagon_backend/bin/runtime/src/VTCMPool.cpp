@@ -12,6 +12,7 @@
 #include "HexagonCommon.h"
 
 VtcmPool::VtcmPool() {
+  owned_ = true;
   compute_res_attr_t resInfo;
   HEXAGON_SAFE_CALL(HAP_compute_res_attr_init(&resInfo));
 
@@ -55,8 +56,24 @@ VtcmPool::VtcmPool() {
                                                vtcmAllocatedSize_));
 }
 
+// Shared-mode ctor (P3.6 / external-resources). Uses caller-provided VTCM
+// memory directly; performs no HAP_compute_res_acquire / query / CHECK. The
+// software free-list is seeded with the full external region, identical to the
+// tail of the standalone ctor.
+VtcmPool::VtcmPool(void *ext_ptr, size_t ext_size) {
+  owned_ = false;
+  vtcmData_ = ext_ptr;
+  vtcmDeviceSize_ = static_cast<unsigned int>(ext_size);
+  vtcmAllocatedSize_ = static_cast<unsigned int>(ext_size);
+  free_.emplace_back(
+      std::pair<char *, size_t>(static_cast<char *>(ext_ptr), ext_size));
+}
+
 VtcmPool::~VtcmPool() {
-  HEXAGON_SAFE_CALL(HAP_compute_res_release(contextId_));
+  if (owned_) {
+    HEXAGON_SAFE_CALL(HAP_compute_res_release(contextId_));
+  }
+  // Shared mode: caller owns the region — do not release.
 }
 
 void *VtcmPool::Allocate(size_t nbytes) {

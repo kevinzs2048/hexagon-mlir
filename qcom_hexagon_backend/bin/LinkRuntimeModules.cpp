@@ -64,6 +64,7 @@ static std::unique_ptr<llvm::Module> get_module(llvm::LLVMContext &context,
 // Initialize all the runtime modules here.
 INIT_MODULE(IntrinsicsHVX);
 INIT_MODULE(VTCMPool);
+INIT_MODULE(HexagonRuntimeShared);
 INIT_MODULE(HexagonAPI);
 INIT_MODULE(HexagonBuffer);
 INIT_MODULE(HexagonBufferAlias);
@@ -176,6 +177,7 @@ void mlir::Hexagon::Translate::linkRuntimeModules(
   std::unique_ptr<llvm::Module> otherModule;
   ADD_MODULE_CAND(IntrinsicsHVX, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(VTCMPool, ctx, otherModule, moduleCandidates);
+  ADD_MODULE_CAND(HexagonRuntimeShared, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(HexagonAPI, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(HexagonBuffer, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(HexagonBufferAlias, ctx, otherModule, moduleCandidates);

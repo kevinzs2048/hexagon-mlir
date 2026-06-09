@@ -66,6 +66,7 @@ set(HEXAGON_RUNTIME_SRC
     UserDMA/UserDMA.cc
     UserDMA/RuntimeDMA.cc
     src/VTCMPool.cpp
+    src/HexagonRuntimeShared.cpp
     src/HexagonBuffer.cpp
     src/HexagonBufferAlias.cpp
     src/HexagonAPI.cpp

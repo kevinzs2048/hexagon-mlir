@@ -18,6 +18,15 @@ public:
   /// Allocates all of VTCM memory, and manages from the runtime
   VtcmPool();
 
+  /// Shared mode (P3.6 / external-resources): use externally-provided VTCM
+  /// memory. Does not call HAP_compute_res_{acquire,release}. The backing
+  /// region is owned by the caller (e.g. a host runtime such as llama.cpp's
+  /// ggml-hexagon backend) which acquired it via HAP_compute_res_acquire.
+  ///
+  /// @param ext_ptr   externally-acquired VTCM pointer (4 KiB aligned)
+  /// @param ext_size  size of the externally-acquired region in bytes
+  VtcmPool(void *ext_ptr, size_t ext_size);
+
   /// Destruction deallocates the underlying VTCM allocation.
   ~VtcmPool();
 
@@ -61,6 +70,10 @@ public:
   }
 
 private:
+  /// True in standalone mode (we acquired VTCM and must release it). False in
+  /// shared mode (caller owns the region; dtor must NOT release it).
+  bool owned_ = true;
+
   /// Total size of VTCM memory on device
   unsigned int vtcmDeviceSize_;
 
