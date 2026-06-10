@@ -75,11 +75,11 @@ public:
     CHECK_EQ(bufferManager, nullptr);
     bufferManager = std::make_unique<BufferManager>();
 
-    // P3.6 Task 7 experiment: external VTCM, but let the kernel self-manage HMX
-    // (acquire its own HMX context + per-thread lock) so it can run directly on
-    // the caller's dispatch thread without routing through an HMX-locked worker
-    // thread. The kernel's HMX lock is on whatever thread first invokes it.
-    hmx_context_id = initialize_and_acquire_hmx();
+    // Task #122 root-cause candidate: self-acquiring HMX here steals the HMX
+    // lock from the host's hmx-queue thread — one elementwise kernel call then
+    // breaks every later host HMX matmul/FA (model-wide garbage). Shared mode
+    // = caller owns HMX; do not touch it.
+    hmx_context_id = 0;
     shared_mode_ = true;
   }
 
