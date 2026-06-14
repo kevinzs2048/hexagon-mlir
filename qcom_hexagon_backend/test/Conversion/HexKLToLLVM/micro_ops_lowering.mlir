@@ -96,6 +96,34 @@ func.func @hvx_layout_weight(%hmx: memref<?xi8, 1>, %src: memref<64x64xf16, 1>) 
   return
 }
 
+// hvx_layout_activation: emits the V6.vscattermhw HVX scatter (no extern C call)
+// reading the activation [M][K] row-major directly, tagging the func with HVX.
+func.func @hvx_layout_activation(%hmx: memref<?xi8, 1>, %src: memref<32x64xf16>) {
+  %act_off = arith.constant 0 : i32
+  %m = arith.constant 32 : i32
+  %k = arith.constant 64 : i32
+  // CHECK-LABEL: llvm.func @hvx_layout_activation
+  // CHECK-SAME: target_features = #llvm.target_features<[{{.*}}"+hvxv73"{{.*}}"+hvx-length128b"{{.*}}]>
+  // CHECK: llvm.call @llvm.hexagon.V6.vscattermhw.128B({{.*}}) : (i32, i32, vector<64xi32>, vector<32xi32>) -> ()
+  hexkl.hvx_layout_activation(%hmx, %act_off, %src, %m, %k) : memref<?xi8, 1>, i32, memref<32x64xf16>, i32, i32
+  return
+}
+
+// hvx_readout: emits the V6.vgathermhw HVX gather + a vector fpext widen (no
+// extern C call), tagging the func with HVX target features.
+func.func @hvx_readout(%hmx: memref<?xi8, 1>, %dst: memref<32x64xf32>) {
+  %out_off = arith.constant 0 : i32
+  %scratch_off = arith.constant 8192 : i32
+  %m = arith.constant 32 : i32
+  %n = arith.constant 64 : i32
+  // CHECK-LABEL: llvm.func @hvx_readout
+  // CHECK-SAME: target_features = #llvm.target_features<[{{.*}}"+hvxv73"{{.*}}"+hvx-length128b"{{.*}}]>
+  // CHECK: llvm.call @llvm.hexagon.V6.vgathermhw.128B({{.*}}) : (!llvm.ptr, i32, i32, vector<64xi32>) -> ()
+  // CHECK: llvm.fpext {{.*}} : vector<32xf16> to vector<32xf32>
+  hexkl.hvx_readout(%hmx, %out_off, %scratch_off, %dst, %m, %n) : memref<?xi8, 1>, i32, i32, memref<32x64xf32>, i32, i32
+  return
+}
+
 // copy_f16_to_f32_submatrix: (ptr, i32, ptr, i32, i32, i32, i32)
 func.func @copy_f16_to_f32(%hmx: memref<?xi8, 1>, %dst: memref<64x64xf32>) {
   %in_off = arith.constant 10240 : i32

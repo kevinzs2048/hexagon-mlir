@@ -85,3 +85,22 @@ func.func @hvx_layout_weight(%hmx: memref<?xi8, 1>, %src: memref<2048x128xf16, 1
   hexkl.hvx_layout_weight(%hmx, %wt_off, %src, %k, %n) : memref<?xi8, 1>, i32, memref<2048x128xf16, 1>, i32, i32
   return
 }
+
+func.func @hvx_layout_activation(%hmx: memref<?xi8, 1>, %src: memref<32x2048xf16>) {
+  %act_off = arith.constant 0 : i32
+  %m = arith.constant 32 : i32
+  %k = arith.constant 2048 : i32
+  // CHECK: hexkl.hvx_layout_activation(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : memref<?xi8, 1>, i32, memref<32x2048xf16>, i32, i32
+  hexkl.hvx_layout_activation(%hmx, %act_off, %src, %m, %k) : memref<?xi8, 1>, i32, memref<32x2048xf16>, i32, i32
+  return
+}
+
+func.func @hvx_readout(%hmx: memref<?xi8, 1>, %dst: memref<32x128xf32>) {
+  %out_off = arith.constant 0 : i32
+  %scratch_off = arith.constant 8192 : i32
+  %m = arith.constant 32 : i32
+  %n = arith.constant 128 : i32
+  // CHECK: hexkl.hvx_readout(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : memref<?xi8, 1>, i32, i32, memref<32x128xf32>, i32, i32
+  hexkl.hvx_readout(%hmx, %out_off, %scratch_off, %dst, %m, %n) : memref<?xi8, 1>, i32, i32, memref<32x128xf32>, i32, i32
+  return
+}

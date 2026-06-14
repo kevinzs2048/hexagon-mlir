@@ -160,6 +160,23 @@ LogicalResult HvxLayoutWeightOp::verify() {
   return verifyNonNegative(op, getWtOff(), "wt_off", getK(), "k", getN(), "n");
 }
 
+LogicalResult HvxLayoutActivationOp::verify() {
+  Operation *op = getOperation();
+  if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
+    return failure();
+
+  return verifyNonNegative(op, getActOff(), "act_off", getM(), "m", getK(), "k");
+}
+
+LogicalResult HvxReadoutOp::verify() {
+  Operation *op = getOperation();
+  if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
+    return failure();
+
+  return verifyNonNegative(op, getOutOff(), "out_off", getScratchOff(),
+                           "scratch_off", getM(), "m", getN(), "n");
+}
+
 LogicalResult HmxCoreDotOp::verify() {
   Operation *op = getOperation();
   if (failed(verifyHmxBlockMemref(op, getHmxBlock())))

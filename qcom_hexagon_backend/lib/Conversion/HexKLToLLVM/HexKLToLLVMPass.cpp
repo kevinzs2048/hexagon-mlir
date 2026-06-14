@@ -988,6 +988,458 @@ struct LowerHvxLayoutWeight
 };
 
 //===----------------------------------------------------------------------===//
+// Lower hexkl::HvxLayoutActivationOp -> inline HVX vscattermhw activation-half
+//===----------------------------------------------------------------------===//
+//
+// Structural clone of LowerHvxLayoutWeight, applied along the K axis instead of
+// the N axis. Reads the activation in [M][K] row-major (DDR or VTCM) directly —
+// folding the vendor copy_submatrix_to_f16 — and scatters each fp16 to its
+// activation-half byte offset, replacing the vendor copy_submatrix + rm_to_ah
+// per-tile loop.
+//
+// Activation-half within-tile byte offset (empirically derived, byte-identical
+// to copy_submatrix + rm_to_ah):
+//     off(r,c) = (r/2)*128 + (r%2)*2 + c*4   for r,c in 0..31
+//   (identical *form* to the weight-half map, but here r is the in-tile ROW and
+//    c the in-tile column of a flat 32x32 fp16 tile).
+// Tile (mt,kt) = (mt*n_k_tiles + kt) at 2048 bytes each.
+//
+// Each DDR row (global row R = mt*32 + r) is contiguous in K, so we load 64
+// contiguous fp16 (cols of two adjacent k-tiles kt,kt+1) per vscattermhw and
+// scatter them to the two adjacent activation-half tiles — mirroring the weight
+// op's N-tile pair scatter. K must be a multiple of 64.
+
+struct LowerHvxLayoutActivation
+    : public ConvertOpToLLVMPattern<hexkl::HvxLayoutActivationOp> {
+  using ConvertOpToLLVMPattern<
+      hexkl::HvxLayoutActivationOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(hexkl::HvxLayoutActivationOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    MLIRContext *ctx = rewriter.getContext();
+
+    auto i32Ty = rewriter.getI32Type();
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+    auto i8Ty = rewriter.getI8Type();
+    auto v64i32 = VectorType::get({64}, i32Ty);
+    auto v32i32 = VectorType::get({32}, i32Ty);
+
+    // Tag the enclosing llvm.func with HVX features (merge, preserve siblings).
+    if (auto enclosing = op->getParentOfType<LLVM::LLVMFuncOp>()) {
+      llvm::SmallVector<StringRef> feats;
+      if (auto existing = enclosing.getTargetFeaturesAttr())
+        for (StringRef f : existing.getFeatures())
+          feats.push_back(f);
+      for (StringRef want : {StringRef("+hvxv73"), StringRef("+hvx-length128b")})
+        if (!llvm::is_contained(feats, want))
+          feats.push_back(want);
+      enclosing.setTargetFeaturesAttr(
+          LLVM::TargetFeaturesAttr::get(ctx, feats));
+    }
+
+    auto scatFn = declareHmxIntrinsic(module, rewriter, kHvxScatterMhw,
+                                      {i32Ty, i32Ty, v64i32, v32i32}, voidTy);
+    if (failed(scatFn))
+      return failure();
+
+    auto cst = [&](int64_t v) -> Value {
+      return rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
+                                               rewriter.getI32IntegerAttr(v));
+    };
+    auto gepI8 = [&](Value base, Value byteOff) -> Value {
+      return rewriter.create<LLVM::GEPOp>(loc, ptrTy, i8Ty, base,
+                                          ValueRange{byteOff});
+    };
+    auto splat64 = [&](Value s) -> Value {
+      Value undef = rewriter.create<LLVM::UndefOp>(loc, v64i32);
+      Value c0 = cst(0);
+      Value ins =
+          rewriter.create<LLVM::InsertElementOp>(loc, v64i32, undef, s, c0);
+      SmallVector<int32_t, 64> zeros(64, 0);
+      return rewriter.create<LLVM::ShuffleVectorOp>(loc, ins, undef,
+                                                    ArrayRef<int32_t>(zeros));
+    };
+
+    // colOff[lane] = (col%32)*4 ; upper[lane] = col/32 (which tile of the pair),
+    // where the deinterleaved lane m -> fp16 2m, 32+m -> fp16 2m+1.
+    SmallVector<int32_t, 64> colOffVals(64), upperVals(64);
+    for (int m = 0; m < 32; ++m) {
+      int ce = 2 * m, co = 2 * m + 1;
+      colOffVals[m] = (ce % 32) * 4;
+      upperVals[m] = (ce / 32);
+      colOffVals[32 + m] = (co % 32) * 4;
+      upperVals[32 + m] = (co / 32);
+    }
+    Value colOff = rewriter.create<LLVM::ConstantOp>(
+        loc, v64i32,
+        DenseElementsAttr::get(v64i32, ArrayRef<int32_t>(colOffVals)));
+    Value upperLane = rewriter.create<LLVM::ConstantOp>(
+        loc, v64i32,
+        DenseElementsAttr::get(v64i32, ArrayRef<int32_t>(upperVals)));
+
+    Value vtcmBase = alignedPtr(rewriter, loc, adaptor.getHmxBlock());
+    Value srcPtr = alignedPtr(rewriter, loc, adaptor.getSrc());
+    Value actOff = adaptor.getActOff();
+    Value M = adaptor.getM();
+    Value K = adaptor.getK();
+
+    Value c0 = cst(0);
+    Value c1 = cst(1);
+    Value c2 = cst(2);
+    Value c32 = cst(32);
+    Value c64 = cst(64);
+    Value c128 = cst(128);
+    Value tileBytes = cst(kHmxTileBytes); // 2048
+    // n_k_tiles = K / 32
+    Value nKTiles = rewriter.create<LLVM::SDivOp>(loc, K, c32);
+    // For activation, adjacent k-tiles within a row are 2048 bytes apart, so the
+    // "upper" tile of a scatter pair is +2048 (one tile). region spans 2 tiles.
+    Value upperOff =
+        rewriter.create<LLVM::MulOp>(loc, upperLane, splat64(tileBytes));
+    Value baseOff64 = rewriter.create<LLVM::AddOp>(loc, colOff, upperOff);
+    // region = 2*2048 - 1 (a scatter pair touches two adjacent tiles).
+    Value twoTiles = rewriter.create<LLVM::MulOp>(loc, tileBytes, c2);
+    Value region = rewriter.create<LLVM::SubOp>(loc, twoTiles, c1);
+
+    // VTCM dst base for the activation region.
+    Value actBase = gepI8(vtcmBase, actOff);
+
+    // for R in [0, M):              (global activation row)
+    //   mt = R / 32 ; r = R % 32
+    //   whR = (r/2)*128 + (r%2)*2 ; voffR = baseOff64 + splat(whR)
+    //   rowPtr = src + R*K*2
+    //   mtTileBase = actBase + mt*n_k_tiles*2048     (tile (mt,0))
+    //   for kc in [0, K) step 64:   (kt = kc/32, scatters tiles kt,kt+1)
+    //     tileBase = mtTileBase + kt*2048
+    //     vval = load <32xi32> rowPtr (advance 128 bytes)
+    //     vscattermhw(ptrtoint(tileBase), region, voffR, vval)
+    Block *origBlock = rewriter.getInsertionBlock();
+    Block *contBlock =
+        rewriter.splitBlock(origBlock, rewriter.getInsertionPoint());
+
+    Block *rHeader = rewriter.createBlock(contBlock, {i32Ty}, {loc});
+    Block *rBody = rewriter.createBlock(contBlock);
+
+    rewriter.setInsertionPointToEnd(origBlock);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, rHeader);
+
+    rewriter.setInsertionPointToEnd(rHeader);
+    Value R = rHeader->getArgument(0);
+    Value rCond =
+        rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, R, M);
+    rewriter.create<LLVM::CondBrOp>(loc, rCond, rBody, ValueRange{}, contBlock,
+                                    ValueRange{});
+
+    rewriter.setInsertionPointToEnd(rBody);
+    Value mt = rewriter.create<LLVM::SDivOp>(loc, R, c32);
+    Value r = rewriter.create<LLVM::SRemOp>(loc, R, c32);
+    Value rHi = rewriter.create<LLVM::SDivOp>(loc, r, c2);
+    Value rLo = rewriter.create<LLVM::SRemOp>(loc, r, c2);
+    Value whR0 = rewriter.create<LLVM::MulOp>(loc, rHi, c128);
+    Value whR1 = rewriter.create<LLVM::MulOp>(loc, rLo, c2);
+    Value whR = rewriter.create<LLVM::AddOp>(loc, whR0, whR1);
+    Value voffR = rewriter.create<LLVM::AddOp>(loc, baseOff64, splat64(whR));
+    // rowPtr = src + R*K*2 bytes
+    Value RK = rewriter.create<LLVM::MulOp>(loc, R, K);
+    Value RKBytes = rewriter.create<LLVM::MulOp>(loc, RK, c2);
+    Value rowPtr = gepI8(srcPtr, RKBytes);
+    // mtTileBase = actBase + mt*n_k_tiles*2048
+    Value mtTiles = rewriter.create<LLVM::MulOp>(loc, mt, nKTiles);
+    Value mtBytes = rewriter.create<LLVM::MulOp>(loc, mtTiles, tileBytes);
+    Value mtTileBase = gepI8(actBase, mtBytes);
+
+    Block *kHeader =
+        rewriter.createBlock(contBlock, {i32Ty, ptrTy, ptrTy}, {loc, loc, loc});
+    Block *kBody = rewriter.createBlock(contBlock);
+    Block *rLatch = rewriter.createBlock(contBlock);
+
+    rewriter.setInsertionPointToEnd(rBody);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0, rowPtr, mtTileBase},
+                               kHeader);
+
+    rewriter.setInsertionPointToEnd(kHeader);
+    Value kc = kHeader->getArgument(0);
+    Value curRowPtr = kHeader->getArgument(1);
+    Value curTilePtr = kHeader->getArgument(2);
+    Value kCond =
+        rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, kc, K);
+    rewriter.create<LLVM::CondBrOp>(loc, kCond, kBody, ValueRange{}, rLatch,
+                                    ValueRange{});
+
+    rewriter.setInsertionPointToEnd(rLatch);
+    Value RNext = rewriter.create<LLVM::AddOp>(loc, R, c1);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{RNext}, rHeader);
+
+    rewriter.setInsertionPointToEnd(kBody);
+    auto loadOp =
+        rewriter.create<LLVM::LoadOp>(loc, v32i32, curRowPtr, /*alignment=*/2);
+    Value vval = loadOp.getResult();
+    Value tileAddrI32 =
+        rewriter.create<LLVM::PtrToIntOp>(loc, i32Ty, curTilePtr);
+    rewriter.create<LLVM::CallOp>(loc, TypeRange{}, *scatFn,
+                                  ValueRange{tileAddrI32, region, voffR, vval});
+    // advance: rowPtr += 128 bytes (64 fp16) ; tileBase += 2*2048 (2 k-tiles)
+    Value rowNext = gepI8(curRowPtr, c128);
+    Value tileNext = gepI8(curTilePtr, twoTiles);
+    Value kcNext = rewriter.create<LLVM::AddOp>(loc, kc, c64);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{kcNext, rowNext, tileNext},
+                               kHeader);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Lower hexkl::HvxReadoutOp -> inline HVX vgathermhw + vcvt (ah->rm + f16->f32)
+//===----------------------------------------------------------------------===//
+//
+// Reads activation-half accumulator tiles, gathers each into flat row-major
+// fp16 via V6.vgathermhw (the inverse of the activation-half scatter, using the
+// identical off(r,c) map), then widens fp16->fp32 via V6.vcvt_sf_hf and stores
+// row-major to DDR [M][N]. Replaces vendor ah_to_rm + copy_f16_to_f32.
+//
+// vgathermhw(Rs, Rt, Mu, Voff): gathers 64 halfwords from base Rt (region Mu+1)
+// at the <64xi32> byte offsets Voff into the VTCM vector at Rs, in the SAME
+// deinterleaved lane order the scatter uses. We gather a full 32x32 tile (1024
+// fp16 = 16 gathers of 64) into a flat row-major scratch tile, then widen+store.
+//
+// vcvt_sf_hf: <64 x f16> -> {<32 x f32>, <32 x f32>} (a vector PAIR, lo=lanes
+// 0..31, hi=lanes 32..63).
+
+static constexpr StringRef kHvxGatherMhw = "llvm.hexagon.V6.vgathermhw.128B";
+
+struct LowerHvxReadout
+    : public ConvertOpToLLVMPattern<hexkl::HvxReadoutOp> {
+  using ConvertOpToLLVMPattern<hexkl::HvxReadoutOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(hexkl::HvxReadoutOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    MLIRContext *ctx = rewriter.getContext();
+
+    auto i32Ty = rewriter.getI32Type();
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+    auto i8Ty = rewriter.getI8Type();
+    auto f16Ty = rewriter.getF16Type();
+    auto f32Ty = rewriter.getF32Type();
+    auto v64i32 = VectorType::get({64}, i32Ty);
+    auto v32i32 = VectorType::get({32}, i32Ty); // = <64xf16> bit-reinterpret
+    auto v32f32 = VectorType::get({32}, f32Ty);
+
+    // Tag the enclosing llvm.func with HVX features (merge, preserve siblings).
+    if (auto enclosing = op->getParentOfType<LLVM::LLVMFuncOp>()) {
+      llvm::SmallVector<StringRef> feats;
+      if (auto existing = enclosing.getTargetFeaturesAttr())
+        for (StringRef f : existing.getFeatures())
+          feats.push_back(f);
+      for (StringRef want : {StringRef("+hvxv73"), StringRef("+hvx-length128b")})
+        if (!llvm::is_contained(feats, want))
+          feats.push_back(want);
+      enclosing.setTargetFeaturesAttr(
+          LLVM::TargetFeaturesAttr::get(ctx, feats));
+    }
+
+    // vgathermhw(ptr Rs, i32 Rt, i32 Mu, <64xi32> off) -> void
+    auto gatherFn = declareHmxIntrinsic(module, rewriter, kHvxGatherMhw,
+                                        {ptrTy, i32Ty, i32Ty, v64i32}, voidTy);
+    if (failed(gatherFn))
+      return failure();
+    (void)v32i32;
+
+    auto cst = [&](int64_t v) -> Value {
+      return rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
+                                               rewriter.getI32IntegerAttr(v));
+    };
+    auto gepI8 = [&](Value base, Value byteOff) -> Value {
+      return rewriter.create<LLVM::GEPOp>(loc, ptrTy, i8Ty, base,
+                                          ValueRange{byteOff});
+    };
+
+    // Build the gather offset table. We gather 64 fp16 per call. Lay them out so
+    // the gathered scratch is flat row-major: gather group g (0..15) covers the
+    // 64 fp16 of rows (2g, 2g+1) — these occupy the contiguous 128-byte AH block
+    // at base (g*128). The deinterleaved lane m -> output fp16 2m, 32+m -> 2m+1.
+    // We want scratch[ (2g)*32 .. ] = row 2g cols0..31, then row 2g+1.
+    // So for this group, output position p (0..63): row = 2g + p/32, col = p%32,
+    // and AH source offset = off(row_in_tile, col) where row_in_tile = (p/32 for
+    // the 2-row sub-block)*? Simpler: gather offsets within the 128-byte block.
+    //   Within an AH block (rows 2g,2g+1): off(2g+sub, c) - off(2g,0)
+    //     = (sub)*2 + c*4   (sub in {0,1}, c in 0..31), since (r/2) constant.
+    // For deinterleaved lane order: lane m (even halfword) -> fp16 2m; we want
+    // gathered output to be row-major [row0 c0..c31, row1 c0..c31]. Map output
+    // position p -> (sub=p/32, c=p%32). Even halfword fp16 index 2m, odd 2m+1.
+    // So output even positions {0,2,..} hold fp16 2m at lane m, etc. We instead
+    // set Voff[lane] to the AH offset of the desired output element so that the
+    // gather lands row-major. Output fp16 index q: lane(q) = (q%2==0)? q/2 :
+    // 32 + q/2. desired element at output q = (sub=q/32, c=q%32) -> ah within
+    // block = sub*2 + c*4.
+    SmallVector<int32_t, 64> offVals(64);
+    for (int q = 0; q < 64; ++q) {
+      int sub = q / 32, c = q % 32;
+      int ahWithinBlock = sub * 2 + c * 4;
+      int lane = (q % 2 == 0) ? (q / 2) : (32 + q / 2);
+      offVals[lane] = ahWithinBlock;
+    }
+    Value offBase = rewriter.create<LLVM::ConstantOp>(
+        loc, v64i32, DenseElementsAttr::get(v64i32, ArrayRef<int32_t>(offVals)));
+
+    Value vtcmBase = alignedPtr(rewriter, loc, adaptor.getHmxBlock());
+    Value dstPtr = alignedPtr(rewriter, loc, adaptor.getDst());
+    Value outOff = adaptor.getOutOff();
+    Value scratchOff = adaptor.getScratchOff();
+    Value M = adaptor.getM();
+    Value N = adaptor.getN();
+
+    Value c0 = cst(0);
+    Value c1 = cst(1);
+    Value c2 = cst(2);
+    Value c4 = cst(4);
+    Value c32 = cst(32);
+    Value c128 = cst(128);
+    Value c2047 = cst(2047);
+    Value tileBytes = cst(kHmxTileBytes);
+    Value scratchPtr = gepI8(vtcmBase, scratchOff);
+    Value outBase = gepI8(vtcmBase, outOff);
+    // n_n_tiles = N / 32
+    Value nNTiles = rewriter.create<LLVM::SDivOp>(loc, N, c32);
+    // n_m_tiles = M / 32
+    Value nMTiles = rewriter.create<LLVM::SDivOp>(loc, M, c32);
+
+    // Loop over output tiles (mt, nt). For each: gather its AH tile (16 groups)
+    // into scratch flat row-major, then widen+store to dst row-major.
+    Block *origBlock = rewriter.getInsertionBlock();
+    Block *contBlock =
+        rewriter.splitBlock(origBlock, rewriter.getInsertionPoint());
+
+    // ---- mt loop ----
+    Block *mtHeader = rewriter.createBlock(contBlock, {i32Ty}, {loc});
+    Block *mtBody = rewriter.createBlock(contBlock);
+    rewriter.setInsertionPointToEnd(origBlock);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, mtHeader);
+    rewriter.setInsertionPointToEnd(mtHeader);
+    Value mt = mtHeader->getArgument(0);
+    Value mtCond =
+        rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, mt, nMTiles);
+    rewriter.create<LLVM::CondBrOp>(loc, mtCond, mtBody, ValueRange{}, contBlock,
+                                    ValueRange{});
+
+    rewriter.setInsertionPointToEnd(mtBody);
+    // ---- nt loop ----
+    Block *ntHeader = rewriter.createBlock(contBlock, {i32Ty}, {loc});
+    Block *ntBody = rewriter.createBlock(contBlock);
+    Block *ntLatch = rewriter.createBlock(contBlock);
+    Block *mtLatch = rewriter.createBlock(contBlock);
+    rewriter.setInsertionPointToEnd(mtBody);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, ntHeader);
+    rewriter.setInsertionPointToEnd(ntHeader);
+    Value nt = ntHeader->getArgument(0);
+    Value ntCond =
+        rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, nt, nNTiles);
+    rewriter.create<LLVM::CondBrOp>(loc, ntCond, ntBody, ValueRange{}, mtLatch,
+                                    ValueRange{});
+
+    rewriter.setInsertionPointToEnd(mtLatch);
+    Value mtNext = rewriter.create<LLVM::AddOp>(loc, mt, c1);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{mtNext}, mtHeader);
+
+    rewriter.setInsertionPointToEnd(ntLatch);
+    Value ntNext = rewriter.create<LLVM::AddOp>(loc, nt, c1);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{ntNext}, ntHeader);
+
+    rewriter.setInsertionPointToEnd(ntBody);
+    // tile (mt,nt) byte base = outBase + (mt*n_n_tiles + nt)*2048
+    Value tileIdx = rewriter.create<LLVM::MulOp>(loc, mt, nNTiles);
+    tileIdx = rewriter.create<LLVM::AddOp>(loc, tileIdx, nt);
+    Value tileByte = rewriter.create<LLVM::MulOp>(loc, tileIdx, tileBytes);
+    Value ahTilePtr = gepI8(outBase, tileByte);
+    Value ahTileAddrI32 =
+        rewriter.create<LLVM::PtrToIntOp>(loc, i32Ty, ahTilePtr);
+
+    // ---- fused per-group loop g in [0,16): gather rows (2g,2g+1) into a
+    //      private scratch vector, then IMMEDIATELY load it back, widen to f32,
+    //      and store. Fusing (vs two separate loops) gives the gather store ->
+    //      load a real same-iteration data dependency so isel keeps them ordered
+    //      (the HVX gather engine writes asynchronously; the consuming load must
+    //      follow it — see llama.cpp hmx-utils gather pattern). ----
+    //
+    // Widening: the HVX qfloat vcvt.sf.hf is non-functional on this v73 part
+    // (returns 0 even via the C builtin), so the f16->f32 conversion is emitted
+    // as a vector fpext (<32xf16> -> <32xf32>) per row. The vgather (the
+    // ah->rm tile reshuffle) is the HVX-vector part replacing the vendor
+    // ah_to_rm; fpext is a plain numeric widen (compiler-emitted, no vendor
+    // call), exact for f16->f32. Two rows (2w, 2w+1) per gathered 128B block.
+    Value c16 = cst(16);
+    auto v32f16 = VectorType::get({32}, f16Ty);
+    Block *wHeader = rewriter.createBlock(contBlock, {i32Ty}, {loc});
+    Block *wBody = rewriter.createBlock(contBlock);
+    rewriter.setInsertionPointToEnd(ntBody);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, wHeader);
+    rewriter.setInsertionPointToEnd(wHeader);
+    Value w = wHeader->getArgument(0); // group of 2 rows, 0..15
+    Value wCond =
+        rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, w, c16);
+    rewriter.create<LLVM::CondBrOp>(loc, wCond, wBody, ValueRange{}, ntLatch,
+                                    ValueRange{});
+    rewriter.setInsertionPointToEnd(wBody);
+    Value wBytes = rewriter.create<LLVM::MulOp>(loc, w, c128);
+    // gather: off_w = offBase + splat(w*128); Rt = ahTile base; Mu=2047.
+    Value wSplat;
+    {
+      Value undef = rewriter.create<LLVM::UndefOp>(loc, v64i32);
+      Value ins =
+          rewriter.create<LLVM::InsertElementOp>(loc, v64i32, undef, wBytes, c0);
+      SmallVector<int32_t, 64> zeros(64, 0);
+      wSplat = rewriter.create<LLVM::ShuffleVectorOp>(loc, ins, undef,
+                                                      ArrayRef<int32_t>(zeros));
+    }
+    Value offW = rewriter.create<LLVM::AddOp>(loc, offBase, wSplat);
+    Value scratchWPtr = gepI8(scratchPtr, wBytes);
+    rewriter.create<LLVM::CallOp>(
+        loc, TypeRange{}, *gatherFn,
+        ValueRange{scratchWPtr, ahTileAddrI32, c2047, offW});
+    // dst row index for the two rows: row0 = mt*32 + 2w, row1 = row0+1.
+    Value mtRow = rewriter.create<LLVM::MulOp>(loc, mt, c32);
+    Value twoW = rewriter.create<LLVM::MulOp>(loc, w, c2);
+    Value row0 = rewriter.create<LLVM::AddOp>(loc, mtRow, twoW);
+    Value row1 = rewriter.create<LLVM::AddOp>(loc, row0, c1);
+    Value ntCol = rewriter.create<LLVM::MulOp>(loc, nt, c32);
+    auto dstRowPtr = [&](Value row) -> Value {
+      Value rn = rewriter.create<LLVM::MulOp>(loc, row, N);
+      Value idx = rewriter.create<LLVM::AddOp>(loc, rn, ntCol);
+      Value byte = rewriter.create<LLVM::MulOp>(loc, idx, c4);
+      return gepI8(dstPtr, byte);
+    };
+    // load the just-gathered 2 rows (row r at scratch+r*64), widen, store.
+    Value c64b = cst(64);
+    // row0: scratch+w*128 ; row1: scratch+w*128+64
+    Value sRow0 = scratchWPtr;
+    Value sRow1 = gepI8(scratchWPtr, c64b);
+    auto widenStore = [&](Value sptr, Value drow) {
+      auto ld = rewriter.create<LLVM::LoadOp>(loc, v32f16, sptr,
+                                              /*alignment=*/2);
+      Value f32v =
+          rewriter.create<LLVM::FPExtOp>(loc, v32f32, ld.getResult());
+      rewriter.create<LLVM::StoreOp>(loc, f32v, dstRowPtr(drow),
+                                     /*alignment=*/4);
+    };
+    widenStore(sRow0, row0);
+    widenStore(sRow1, row1);
+    Value wNext = rewriter.create<LLVM::AddOp>(loc, w, c1);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{wNext}, wHeader);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Setup the Lowering Pass and patterns
 //===----------------------------------------------------------------------===//
 
@@ -1004,6 +1456,8 @@ void populateHexKLToLLVMConversionPatterns(LLVMTypeConverter &converter,
   patterns.add<LowerHmxCoreDot>(converter);
   // Lower the fast HVX weight-half layout to inline vscatter.
   patterns.add<LowerHvxLayoutWeight>(converter);
+  // Lower the fast HVX activation-half layout + accumulator readout.
+  patterns.add<LowerHvxLayoutActivation, LowerHvxReadout>(converter);
 }
 
 struct HexKLToLLVMPass : public HexKLToLLVMBase<HexKLToLLVMPass> {

@@ -294,6 +294,74 @@ def HexKL_HvxLayoutWeightOp
     "`(` $hmx_block `,` $wt_off `,` $src `,` $k `,` $n `)` `:` type($hmx_block) `,` type($wt_off) `,` type($src) `,` type($k) `,` type($n) attr-dict";
 }
 
+def HexKL_HvxLayoutActivationOp
+  : HexKL_Op<"hvx_layout_activation",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+
+  let summary = "Fast HVX activation-half tile layout via vscatter";
+  let description = [{
+    Lays out a row-major [M][K] FP16 activation (in DDR or VTCM) into the HMX
+    activation-half tile format, writing to the VTCM `hmx_block` at `act_off`.
+    Emits inline HVX `V6.vscattermhw` halfword scatters, replacing the vendor
+    `copy_submatrix_to_f16` + `rm_to_ah_f16` per-tile loop — byte-identical.
+
+    The activation is consumed directly in [M][K] row-major (no separate
+    submatrix copy): for each (mt,kt) 32x32 tile, each fp16 of a tile row is
+    scattered to its activation-half byte offset
+        off(r,c) = (r/2)*128 + (r%2)*2 + c*4   (r,c in 0..31)
+    Tile (mt,kt) lands at act_off + (mt*n_k_tiles + kt)*2048. M and K must be
+    multiples of 32.
+  }];
+
+  let arguments = (ins
+    AnyNon0RankedMemRef:$hmx_block,
+    I32:$act_off,
+    AnyNon0RankedMemRef:$src,
+    I32:$m,
+    I32:$k
+  );
+
+  let results = (outs);
+
+  let assemblyFormat =
+    "`(` $hmx_block `,` $act_off `,` $src `,` $m `,` $k `)` `:` type($hmx_block) `,` type($act_off) `,` type($src) `,` type($m) `,` type($k) attr-dict";
+}
+
+def HexKL_HvxReadoutOp
+  : HexKL_Op<"hvx_readout",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+
+  let summary = "Fast HVX accumulator readout (ah->rm + f16->f32) via vgather";
+  let description = [{
+    Reads the HMX accumulator output tiles (activation-half FP16, in VTCM at
+    `out_off`), converts to row-major FP32, and writes a row-major [M][N] FP32
+    matrix `dst` (in DDR). Emits inline HVX `V6.vgathermhw` (the inverse of the
+    activation-half scatter) to gather each tile into flat row-major FP16, then
+    `V6.vcvt_sf_hf` to widen to FP32 — replacing the vendor `ah_to_rm_f16` +
+    `copy_f16_to_f32_submatrix` per-tile loop. Byte-identical FP32 output.
+
+    Output tile (mt,nt) read from out_off + (mt*n_n_tiles + nt)*2048; each fp16
+    at activation-half byte offset off(r,c)=(r/2)*128+(r%2)*2+c*4 is placed at
+    dst[mt*32+r][nt*32+c]. M and N must be multiples of 32.
+  }];
+
+  let arguments = (ins
+    AnyNon0RankedMemRef:$hmx_block,
+    I32:$out_off,
+    I32:$scratch_off,
+    AnyNon0RankedMemRef:$dst,
+    I32:$m,
+    I32:$n
+  );
+
+  let results = (outs);
+
+  let assemblyFormat =
+    "`(` $hmx_block `,` $out_off `,` $scratch_off `,` $dst `,` $m `,` $n `)` `:` type($hmx_block) `,` type($out_off) `,` type($scratch_off) `,` type($dst) `,` type($m) `,` type($n) attr-dict";
+}
+
 def HexKL_HmxCoreDotOp
   : HexKL_Op<"hmx_core_dot",
       [MemoryEffects<[MemRead, MemWrite]>]> {
