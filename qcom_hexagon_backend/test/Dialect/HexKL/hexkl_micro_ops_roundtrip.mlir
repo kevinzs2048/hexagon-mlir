@@ -76,3 +76,12 @@ func.func @copy_f16_to_f32(%hmx: memref<?xi8, 1>, %dst: memref<64x64xf32>) {
   hexkl.micro_hmx_copy_f16_to_f32_submatrix(%hmx, %in_off, %dst, %row, %col, %rows, %cols) : memref<?xi8, 1>, i32, memref<64x64xf32>, i32, i32, i32, i32
   return
 }
+
+func.func @hvx_layout_weight(%hmx: memref<?xi8, 1>, %src: memref<2048x128xf16, 1>) {
+  %wt_off = arith.constant 0 : i32
+  %k = arith.constant 2048 : i32
+  %n = arith.constant 128 : i32
+  // CHECK: hexkl.hvx_layout_weight(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : memref<?xi8, 1>, i32, memref<2048x128xf16, 1>, i32, i32
+  hexkl.hvx_layout_weight(%hmx, %wt_off, %src, %k, %n) : memref<?xi8, 1>, i32, memref<2048x128xf16, 1>, i32, i32
+  return
+}

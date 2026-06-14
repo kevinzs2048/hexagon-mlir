@@ -83,6 +83,19 @@ func.func @ah_to_rm(%hmx: memref<?xi8, 1>) {
   return
 }
 
+// hvx_layout_weight: emits the V6.vscattermhw HVX scatter (no extern C call),
+// and tags the enclosing func with the HVX target features.
+func.func @hvx_layout_weight(%hmx: memref<?xi8, 1>, %src: memref<64x64xf16, 1>) {
+  %wt_off = arith.constant 0 : i32
+  %k = arith.constant 64 : i32
+  %n = arith.constant 64 : i32
+  // CHECK-LABEL: llvm.func @hvx_layout_weight
+  // CHECK-SAME: target_features = #llvm.target_features<[{{.*}}"+hvxv73"{{.*}}"+hvx-length128b"{{.*}}]>
+  // CHECK: llvm.call @llvm.hexagon.V6.vscattermhw.128B({{.*}}) : (i32, i32, vector<64xi32>, vector<32xi32>) -> ()
+  hexkl.hvx_layout_weight(%hmx, %wt_off, %src, %k, %n) : memref<?xi8, 1>, i32, memref<64x64xf16, 1>, i32, i32
+  return
+}
+
 // copy_f16_to_f32_submatrix: (ptr, i32, ptr, i32, i32, i32, i32)
 func.func @copy_f16_to_f32(%hmx: memref<?xi8, 1>, %dst: memref<64x64xf32>) {
   %in_off = arith.constant 10240 : i32

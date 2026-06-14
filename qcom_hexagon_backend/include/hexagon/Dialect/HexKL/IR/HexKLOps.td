@@ -262,6 +262,38 @@ def HexKL_MicroHMXCopyF16ToF32SubmatrixOp
     "`(` $hmx_block `,` $in_offset `,` $dst `,` $tile_row `,` $tile_col `,` $output_rows `,` $output_cols `)` `:` type($hmx_block) `,` type($in_offset) `,` type($dst) `,` type($tile_row) `,` type($tile_col) `,` type($output_rows) `,` type($output_cols) attr-dict";
 }
 
+def HexKL_HvxLayoutWeightOp
+  : HexKL_Op<"hvx_layout_weight",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+
+  let summary = "Fast HVX weight-half tile layout via vscatter";
+  let description = [{
+    Lays out a row-major [K][N] FP16 weight (resident in VTCM) into the HMX
+    weight-half tile format, writing to the VTCM `hmx_block` at `wt_off`. Emits
+    inline HVX `V6.vscattermhw` halfword scatters instead of per-tile vendor
+    `rm_to_wh` calls — byte-identical output, ~8x faster.
+
+    The weight is consumed in the orientation the matmul provides ([K][N]
+    row-major): for each K-row, the contiguous N values are scattered to their
+    weight-half byte offsets directly, with NO separate transpose. K and N must
+    be multiples of 32; N must be a multiple of 64 (pair-tile scatter).
+  }];
+
+  let arguments = (ins
+    AnyNon0RankedMemRef:$hmx_block,
+    I32:$wt_off,
+    AnyNon0RankedMemRef:$src,
+    I32:$k,
+    I32:$n
+  );
+
+  let results = (outs);
+
+  let assemblyFormat =
+    "`(` $hmx_block `,` $wt_off `,` $src `,` $k `,` $n `)` `:` type($hmx_block) `,` type($wt_off) `,` type($src) `,` type($k) `,` type($n) attr-dict";
+}
+
 def HexKL_HmxCoreDotOp
   : HexKL_Op<"hmx_core_dot",
       [MemoryEffects<[MemRead, MemWrite]>]> {
