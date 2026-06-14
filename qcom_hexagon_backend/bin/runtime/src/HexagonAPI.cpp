@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include "HexagonAPI.h"
+#include "HAP_dcvs.h"  /* turbo DCVS corners: lock DSP core/bus to max clock */
 
 HexagonAPI *HexagonAPI::Global() {
   static auto *inst = new HexagonAPI();
@@ -28,13 +29,55 @@ void *HexagonAPI::Alloc(size_t nbytes, uint64_t alignment, bool isVtcm) {
   return base_ptr;
 }
 
+// Lock the DSP core+bus to the max DCVS voltage corner (turbo) and disable
+// sleep, mirroring the llama.cpp Hexagon backend. Without this the kernel runs
+// at the default DCVS clock, which is a uniform slowdown across the whole
+// mega-kernel. DCVS corners are clamped, not dynamically varied. Called from
+// initialize_and_acquire_hmx, which AcquireResources() runs for every standalone
+// kernel (HMX and HVX alike), so all standalone kernels get turbo. Measured: HMX
+// mega-kernel 2.1-2.6x faster; pure-HVX mega-kernel is unaffected (not core-clock
+// bound). Shared mode (host-registered resources, e.g. llama.cpp path A) skips
+// this path — the host already set turbo itself.
+static void set_dsp_turbo() {
+  static int turbo_ctx;
+  {
+    HAP_power_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.type = HAP_power_set_apptype;
+    req.apptype = HAP_POWER_COMPUTE_CLIENT_CLASS;
+    HAP_power_set((void *)&turbo_ctx, &req);
+  }
+  {
+    HAP_power_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.type = HAP_power_set_DCVS_v3;
+    req.dcvs_v3.set_dcvs_enable = TRUE;
+    req.dcvs_v3.dcvs_enable = FALSE;
+    req.dcvs_v3.set_bus_params = TRUE;
+    req.dcvs_v3.bus_params.min_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.bus_params.max_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.bus_params.target_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.set_core_params = TRUE;
+    req.dcvs_v3.core_params.min_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.core_params.max_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_MAX;
+    req.dcvs_v3.set_sleep_disable = TRUE;
+    req.dcvs_v3.sleep_disable = TRUE;
+    int rc = HAP_power_set((void *)&turbo_ctx, &req);
+    if (rc != AEE_SUCCESS)
+      FARF(ERROR, "DCVS_v3 turbo request failed rc=%d", rc);
+  }
+}
+
 uint32_t HexagonAPI::initialize_and_acquire_hmx() {
+  int *power_context = (int *)malloc(sizeof(int));
+
+  set_dsp_turbo();
+
   HAP_power_request_t request;
   memset(&request, 0, sizeof(HAP_power_request_t));
   request.type = HAP_power_set_HMX;
   request.hmx.power_up = TRUE;
-
-  int *power_context = (int *)malloc(sizeof(int));
 
   int retVal = HAP_power_set((void *)power_context, &request);
   if (retVal != AEE_SUCCESS) {
