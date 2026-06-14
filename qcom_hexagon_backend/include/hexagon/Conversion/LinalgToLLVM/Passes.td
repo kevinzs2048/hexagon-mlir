@@ -88,6 +88,10 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
     Option<"enableHexKL", "enable-hexkl", "bool",
           /*default=*/"false",
           "Enable linalg matmul to hexkl dialect lowering">,
+    Option<"enableInlineHMX", "enable-inline-hmx", "bool",
+          /*default=*/"false",
+          "Route hexkl.matmul decomposition to the inline hexkl.hmx_core_dot "
+          "op instead of per-tile micro HMX ops">,
     Option<"enableCollapseAddressSpace", "enable-collapse-address-space", "bool",
           /*default=*/"true",
           "replace llvm.ptr<1> with llvm.ptr at last stage of convert-to-llvm">,

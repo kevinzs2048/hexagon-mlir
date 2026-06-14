@@ -38,7 +38,10 @@ using namespace hexagon;
 namespace {
 
 struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
-  DecomposeHexKLMatmul(MLIRContext *ctx) : OpRewritePattern(ctx) {}
+  DecomposeHexKLMatmul(MLIRContext *ctx, bool useInlineHMX)
+      : OpRewritePattern(ctx), useInlineHMX(useInlineHMX) {}
+
+  bool useInlineHMX = false;
 
   LogicalResult matchAndRewrite(hexkl::MatmulOp op,
                                 PatternRewriter &rewriter) const override {
@@ -108,6 +111,20 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value kPlus31 = rewriter.create<arith::AddIOp>(loc, dimK, idx31);
     Value kTiles = rewriter.create<arith::DivUIOp>(loc, kPlus31, idx32);
     Value kTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, kTiles);
+
+    // ----------------------------------------------------------------------
+    // Inline-HMX path (mirrors the proven hmx-spike pipeline). When enabled,
+    // replace the per-output-tile micro compute with ONE hexkl.hmx_core_dot
+    // over an all-resident VTCM arena. Layout + readout reuse the existing
+    // micro ops. Default-off path (below) is left byte-identical.
+    // ----------------------------------------------------------------------
+    if (useInlineHMX) {
+      if (failed(rewriteInlineHMX(op, rewriter, loc, lhs, rhs, result, i32Ty,
+                                  idx0, idx1, idx32, dimM, dimN, M, K, N, kTiles,
+                                  kTilesI32)))
+        return failure();
+      return success();
+    }
 
     // Calculate VTCM size: (numKTiles*2 + 2 + 3) * 4096
     // Layout: [act_tiles | scratch_tiles | flat_out | acc_read | extra]
@@ -229,14 +246,209 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     rewriter.eraseOp(op);
     return success();
   }
+
+  // Inline-HMX decomposition: all-resident VTCM arena + one hexkl.hmx_core_dot.
+  // Mirrors the proven hmx-spike pipeline (spike_main.cpp / spike_layout.c /
+  // spike_dequant.c / spike_hmx_mm.c):
+  //   1. arena holding act/wt/out/bias/scratch tiles simultaneously
+  //   2. lay out ALL activation tiles -> act[mt][kt]
+  //   3. lay out ALL weight tiles     -> wt[nt][kt]  (N outer, K inner)
+  //   4. init bias struct (0x00003c00 per-column-scale=1.0,bias=0 in first 32
+  //      i32 lanes; rest zero)  -- spike T6 finding
+  //   5. ONE hexkl.hmx_core_dot(vtcm, out, act, wt, bias, m_t, n_t, k_t)
+  //   6. readout per (mt,nt) -> ah_to_rm + copy_f16_to_f32 -> DDR
+  LogicalResult rewriteInlineHMX(hexkl::MatmulOp op, PatternRewriter &rewriter,
+                                 Location loc, Value lhs, Value rhs,
+                                 Value result, Type i32Ty, Value idx0,
+                                 Value idx1, Value idx32, Value dimM, Value dimN,
+                                 Value M, Value K, Value N, Value kTiles,
+                                 Value kTilesI32) const {
+    // Tile counts (index + i32).
+    Value mTiles = rewriter.create<arith::DivUIOp>(loc, dimM, idx32);
+    Value nTiles = rewriter.create<arith::DivUIOp>(loc, dimN, idx32);
+    Value mTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, mTiles);
+    Value nTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, nTiles);
+
+    // Tile stride is 2048 bytes (32x32 fp16), matching the spike kernel's
+    // contiguous deep-streaming reads (HMX_FP16_TILE_N_ELMS = 1024 elms).
+    Value i32_2048 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 2048);
+    Value idx2048 = rewriter.create<arith::ConstantIndexOp>(loc, 2048);
+
+    // Region byte sizes (index).
+    Value mkTiles = rewriter.create<arith::MulIOp>(loc, mTiles, kTiles);
+    Value nkTiles = rewriter.create<arith::MulIOp>(loc, nTiles, kTiles);
+    Value mnTiles = rewriter.create<arith::MulIOp>(loc, mTiles, nTiles);
+    Value actBytes = rewriter.create<arith::MulIOp>(loc, mkTiles, idx2048);
+    Value wtBytes = rewriter.create<arith::MulIOp>(loc, nkTiles, idx2048);
+    Value outBytes = rewriter.create<arith::MulIOp>(loc, mnTiles, idx2048);
+
+    // Arena offsets (i32 bytes). act|wt|out|bias|flat|scratch, all 2048-aligned.
+    Value actOffI32 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 0);
+    Value actBytesI32 =
+        rewriter.create<arith::IndexCastOp>(loc, i32Ty, actBytes);
+    Value wtBytesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, wtBytes);
+    Value outBytesI32 =
+        rewriter.create<arith::IndexCastOp>(loc, i32Ty, outBytes);
+    Value wtOffI32 =
+        rewriter.create<arith::AddIOp>(loc, actOffI32, actBytesI32);
+    Value outOffI32 = rewriter.create<arith::AddIOp>(loc, wtOffI32, wtBytesI32);
+    Value biasOffI32 =
+        rewriter.create<arith::AddIOp>(loc, outOffI32, outBytesI32);
+    // One bias tile, then a flat readout tile, then a layout scratch tile.
+    Value flatOffI32 =
+        rewriter.create<arith::AddIOp>(loc, biasOffI32, i32_2048);
+    Value scratchOffI32 =
+        rewriter.create<arith::AddIOp>(loc, flatOffI32, i32_2048);
+
+    // Total arena bytes = scratchOff + one tile (index).
+    Value scratchOffIdx =
+        rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(),
+                                            scratchOffI32);
+    Value vtcmBytes =
+        rewriter.create<arith::AddIOp>(loc, scratchOffIdx, idx2048);
+
+    // Manual VTCM alloc; tag for bufferization and dealloc after the readout.
+    auto vtcmType =
+        MemRefType::get({ShapedType::kDynamic}, rewriter.getI8Type(),
+                        MemRefLayoutAttrInterface{},
+                        IntegerAttr::get(rewriter.getI32Type(), 1));
+    auto vtcmAlloc =
+        rewriter.create<hexagonmem::AllocOp>(loc, vtcmType, vtcmBytes);
+    vtcmAlloc->setAttr("bufferization.manual_deallocation",
+                       rewriter.getUnitAttr());
+    Value vtcm = vtcmAlloc.getResult();
+
+    // Setup HMX accumulator for acc-read output.
+    rewriter.create<hexkl::MicroHMXSetupAccReadF16Op>(loc, vtcm);
+
+    // --- 2. lay out ALL activation tiles: act[mt][kt] ---
+    rewriter.create<scf::ForOp>(
+        loc, idx0, mTiles, idx1, ValueRange{},
+        [&](OpBuilder &b, Location loc, Value mt, ValueRange) {
+          Value mtI32 = b.create<arith::IndexCastOp>(loc, i32Ty, mt);
+          b.create<scf::ForOp>(
+              loc, idx0, kTiles, idx1, ValueRange{},
+              [&](OpBuilder &bb, Location loc, Value kt, ValueRange) {
+                Value ktI32 = bb.create<arith::IndexCastOp>(loc, i32Ty, kt);
+                // DDR row-major -> flat 32x32 tile in scratch.
+                bb.create<hexkl::MicroHMXCopySubmatrixToF16Op>(
+                    loc, vtcm, scratchOffI32, lhs, mtI32, ktI32, M, K);
+                // flat -> activation-half at act[mt][kt] = (mt*k_t+kt)*2048.
+                Value tileIdx = bb.create<arith::MulIOp>(loc, mtI32, kTilesI32);
+                tileIdx = bb.create<arith::AddIOp>(loc, tileIdx, ktI32);
+                Value ahOff =
+                    bb.create<arith::MulIOp>(loc, tileIdx, i32_2048);
+                ahOff = bb.create<arith::AddIOp>(loc, ahOff, actOffI32);
+                bb.create<hexkl::MicroHMXRmToAhF16Op>(loc, vtcm, ahOff,
+                                                      scratchOffI32);
+                bb.create<scf::YieldOp>(loc);
+              });
+          b.create<scf::YieldOp>(loc);
+        });
+
+    // --- 3. lay out ALL weight tiles: wt[nt][kt] (N outer, K inner) ---
+    // rm_to_wh(row_tile=kt along K, col_tile=nt along N, wt_cols=N); tile (nt,kt)
+    // lands at wtOff + (nt*k_t + kt)*2048 -- the order hmx_core_dot's col loop
+    // expects (spike T8 weight-tile-order fix).
+    rewriter.create<scf::ForOp>(
+        loc, idx0, kTiles, idx1, ValueRange{},
+        [&](OpBuilder &b, Location loc, Value kt, ValueRange) {
+          Value ktI32 = b.create<arith::IndexCastOp>(loc, i32Ty, kt);
+          b.create<scf::ForOp>(
+              loc, idx0, nTiles, idx1, ValueRange{},
+              [&](OpBuilder &bb, Location loc, Value nt, ValueRange) {
+                Value ntI32 = bb.create<arith::IndexCastOp>(loc, i32Ty, nt);
+                Value tileIdx = bb.create<arith::MulIOp>(loc, ntI32, kTilesI32);
+                tileIdx = bb.create<arith::AddIOp>(loc, tileIdx, ktI32);
+                Value whOff =
+                    bb.create<arith::MulIOp>(loc, tileIdx, i32_2048);
+                whOff = bb.create<arith::AddIOp>(loc, whOff, wtOffI32);
+                bb.create<hexkl::MicroHMXRmToWhF16Op>(loc, vtcm, whOff, rhs,
+                                                      ktI32, ntI32, N);
+                bb.create<scf::YieldOp>(loc);
+              });
+          b.create<scf::YieldOp>(loc);
+        });
+
+    // --- 4. init bias struct in the bias tile ---
+    // HMX scale/bias structure for Q6_bias_mxmem2_A: first 32 i32 lanes =
+    // 0x00003c00 (per-column scale 1.0, bias 0), rest of the 2048-byte tile 0.
+    // View the i8 VTCM at byte offset biasOff as 512 x i32 and fill.
+    {
+      auto i32MemTy =
+          MemRefType::get({512}, i32Ty, MemRefLayoutAttrInterface{},
+                          IntegerAttr::get(rewriter.getI32Type(), 1));
+      Value biasOffIdx = rewriter.create<arith::IndexCastOp>(
+          loc, rewriter.getIndexType(), biasOffI32);
+      Value biasView = rewriter.create<memref::ViewOp>(
+          loc, i32MemTy, vtcm, biasOffIdx, ValueRange{});
+      Value cScale =
+          rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 0x00003c00);
+      Value cZero = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 0);
+      Value idx512 = rewriter.create<arith::ConstantIndexOp>(loc, 512);
+      rewriter.create<scf::ForOp>(
+          loc, idx0, idx512, idx1, ValueRange{},
+          [&](OpBuilder &b, Location loc, Value i, ValueRange) {
+            Value isScale = b.create<arith::CmpIOp>(
+                loc, arith::CmpIPredicate::ult, i, idx32);
+            Value v = b.create<arith::SelectOp>(loc, isScale, cScale, cZero);
+            b.create<memref::StoreOp>(loc, v, biasView, ValueRange{i});
+            b.create<scf::YieldOp>(loc);
+          });
+    }
+
+    // --- 5. ONE hexkl.hmx_core_dot ---
+    rewriter.create<hexkl::HmxCoreDotOp>(
+        loc, vtcm, outOffI32, actOffI32, wtOffI32, biasOffI32, mTilesI32,
+        nTilesI32, kTilesI32);
+
+    // --- 6. readout per (mt,nt) output tile: ah_to_rm + copy_f16_to_f32 ---
+    // out tile (mt,nt) at outOff + (mt*n_t + nt)*2048 (matches hmx_core_dot's
+    // (r*n_col_tiles+c) write order).
+    rewriter.create<scf::ForOp>(
+        loc, idx0, mTiles, idx1, ValueRange{},
+        [&](OpBuilder &b, Location loc, Value mt, ValueRange) {
+          Value mtI32 = b.create<arith::IndexCastOp>(loc, i32Ty, mt);
+          b.create<scf::ForOp>(
+              loc, idx0, nTiles, idx1, ValueRange{},
+              [&](OpBuilder &bb, Location loc, Value nt, ValueRange) {
+                Value ntI32 = bb.create<arith::IndexCastOp>(loc, i32Ty, nt);
+                Value tileIdx = bb.create<arith::MulIOp>(loc, mtI32, nTilesI32);
+                tileIdx = bb.create<arith::AddIOp>(loc, tileIdx, ntI32);
+                Value outTileOff =
+                    bb.create<arith::MulIOp>(loc, tileIdx, i32_2048);
+                outTileOff =
+                    bb.create<arith::AddIOp>(loc, outTileOff, outOffI32);
+                // acc-read output tile (activation layout) -> flat row-major.
+                bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOffI32,
+                                                      outTileOff);
+                // flat f16 -> DDR f32 submatrix.
+                bb.create<hexkl::MicroHMXCopyF16ToF32SubmatrixOp>(
+                    loc, vtcm, flatOffI32, result, mtI32, ntI32, M, N);
+                bb.create<scf::YieldOp>(loc);
+              });
+          b.create<scf::YieldOp>(loc);
+        });
+
+    // Explicitly deallocate VTCM buffer.
+    rewriter.create<hexagonmem::DeallocOp>(loc, vtcm);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
 };
 
-void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns) {
-  patterns.add<DecomposeHexKLMatmul>(patterns.getContext());
+void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns,
+                                          bool useInlineHMX) {
+  patterns.add<DecomposeHexKLMatmul>(patterns.getContext(), useInlineHMX);
 }
 
 struct DecomposeHexKLMatmulPass
     : public ::impl::DecomposeHexKLMatmulBase<DecomposeHexKLMatmulPass> {
+  DecomposeHexKLMatmulPass() = default;
+  explicit DecomposeHexKLMatmulPass(const DecomposeHexKLMatmulOptions &options)
+      : DecomposeHexKLMatmulBase(options) {}
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
         .insert<hexkl::HexKLDialect, hexagonmem::HexagonMemDialect,
@@ -245,7 +457,7 @@ struct DecomposeHexKLMatmulPass
 
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
-    populateDecomposeHexKLMatmulPatterns(patterns);
+    populateDecomposeHexKLMatmulPatterns(patterns, useInlineHMX);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
@@ -257,4 +469,10 @@ struct DecomposeHexKLMatmulPass
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 hexagon::createDecomposeHexKLMatmulPass() {
   return std::make_unique<DecomposeHexKLMatmulPass>();
+}
+
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+hexagon::createDecomposeHexKLMatmulPass(
+    const DecomposeHexKLMatmulOptions &options) {
+  return std::make_unique<DecomposeHexKLMatmulPass>(options);
 }

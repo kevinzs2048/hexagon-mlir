@@ -75,6 +75,8 @@ void setLinalgToLLVMOptions(
   options.enableHexagonmemCopyToDMA =
       !arch_kwargs.at("enableHexagonmemCopyToDMA").compare(TRUE);
   options.enableHexKL = !arch_kwargs.at("enableHexKL").compare(TRUE);
+  options.enableInlineHMX =
+      !arch_kwargs.at("enableInlineHMX").compare(TRUE);
   options.enableCollapseAddressSpace =
       !arch_kwargs.at("enableCollapseAddressSpace").compare(TRUE);
   options.tileSizes = arch_kwargs.at("tileSizes");

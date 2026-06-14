@@ -244,7 +244,18 @@ def DecomposeHexKLMatmul :
     - Activation and weight tile loading and layout conversion
     - HMX matrix multiplication with accumulation
     - Result readback and format conversion (f16 to f32)
+
+    When useInlineHMX is enabled, the per-output-tile micro-op compute
+    (acc-clear / mm / acc-read) is replaced by a single hexkl.hmx_core_dot op
+    (inline deep-streaming HMX intrinsics) over all-resident VTCM tiles. The
+    activation/weight layout and the result readback are unchanged. Default off.
   }];
+  let options = [
+    Option<"useInlineHMX", "use-inline-hmx", "bool",
+          /*default=*/"false",
+          "decompose matmul to the inline hexkl.hmx_core_dot op instead of "
+          "per-tile micro HMX ops">,
+  ];
   let constructor = "hexagon::createDecomposeHexKLMatmulPass()";
 }
 

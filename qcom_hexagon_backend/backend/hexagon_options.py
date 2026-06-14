@@ -57,6 +57,9 @@ class HexagonOptions:
     enableConvertToHexagonmem: bool = True  # rewrites memref.alloc/copy to hexagonmem.*
     enableHexagonmemCopyToDMA: bool = False  # rewrites hexmem.copy to memref.dma_*
     enableHexKL: bool = False  # use HexKL to lower matmul and convolutions
+    enableInlineHMX: bool = (
+        False  # route hexkl.matmul to inline hexkl.hmx_core_dot (needs enableHexKL)
+    )
     enableMultiThreading: bool = False  # linalg-generic based multi-threading
     enableSCFThreading: bool = False  # scf based multi-threading
     enableSplitReduction: bool = False  # split-reduction optimization

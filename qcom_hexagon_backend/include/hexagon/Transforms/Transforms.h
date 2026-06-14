@@ -84,6 +84,8 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>> createMatmulToHexKLPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createDecomposeHexKLMatmulPass();
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createDecomposeHexKLMatmulPass(const DecomposeHexKLMatmulOptions &options);
 
 std::unique_ptr<OperationPass<func::FuncOp>> createMemoryOffsetsPass();
 

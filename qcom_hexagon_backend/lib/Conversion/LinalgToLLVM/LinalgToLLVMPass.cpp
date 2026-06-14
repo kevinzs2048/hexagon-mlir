@@ -339,9 +339,13 @@ public:
     if (enableConvertToHexagonmem)
       pm.addNestedPass<func::FuncOp>(createConvertToHexagonmemPass());
 
-    // Decompose hexkl.matmul to micro ops
-    if (enableHexKL)
-      pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
+    // Decompose hexkl.matmul to micro ops (or inline hexkl.hmx_core_dot).
+    if (enableHexKL) {
+      DecomposeHexKLMatmulOptions decomposeOpts;
+      decomposeOpts.useInlineHMX = enableInlineHMX;
+      pm.addNestedPass<func::FuncOp>(
+          createDecomposeHexKLMatmulPass(decomposeOpts));
+    }
 
     // Lower linalg ops with library_call attribute set to custom fns.
     pm.addPass(createHexagonReplaceWithLibraryCallsPass());
