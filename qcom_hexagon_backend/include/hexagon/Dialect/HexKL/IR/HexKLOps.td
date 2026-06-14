@@ -262,4 +262,32 @@ def HexKL_MicroHMXCopyF16ToF32SubmatrixOp
     "`(` $hmx_block `,` $in_offset `,` $dst `,` $tile_row `,` $tile_col `,` $output_rows `,` $output_cols `)` `:` type($hmx_block) `,` type($in_offset) `,` type($dst) `,` type($tile_row) `,` type($tile_col) `,` type($output_rows) `,` type($output_cols) attr-dict";
 }
 
+def HexKL_HmxCoreDotOp
+  : HexKL_Op<"hmx_core_dot",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+
+  let summary = "Deep-streaming HMX fp16 matmul over VTCM-resident tiles";
+  let description = [{
+    Deep-streaming HMX fp16 matmul over VTCM-resident activation-half/weight-half
+    tiles; lowers to inline HMX intrinsics.
+  }];
+
+  let arguments = (ins
+    AnyNon0RankedMemRef:$hmx_block,
+    I32:$out_off,
+    I32:$act_off,
+    I32:$wt_off,
+    I32:$bias_off,
+    I32:$n_row_tiles,
+    I32:$n_col_tiles,
+    I32:$n_dot_tiles
+  );
+
+  let results = (outs);
+
+  let assemblyFormat =
+    "`(` $hmx_block `,` $out_off `,` $act_off `,` $wt_off `,` $bias_off `,` $n_row_tiles `,` $n_col_tiles `,` $n_dot_tiles `)` `:` type($hmx_block) `,` type($out_off) `,` type($act_off) `,` type($wt_off) `,` type($bias_off) `,` type($n_row_tiles) `,` type($n_col_tiles) `,` type($n_dot_tiles) attr-dict";
+}
+
 #endif // HEXAGON_DIALECT_HEXKL_IR_HEXKL_OPS_TD

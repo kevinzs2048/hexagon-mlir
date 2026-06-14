@@ -151,3 +151,14 @@ LogicalResult MicroHMXCopyF16ToF32SubmatrixOp::verify() {
                            getOutputRows(), "output_rows", getOutputCols(),
                            "output_cols");
 }
+
+LogicalResult HmxCoreDotOp::verify() {
+  Operation *op = getOperation();
+  if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
+    return failure();
+
+  return verifyNonNegative(op, getOutOff(), "out_off", getActOff(), "act_off",
+                           getWtOff(), "wt_off", getBiasOff(), "bias_off",
+                           getNRowTiles(), "n_row_tiles", getNColTiles(),
+                           "n_col_tiles", getNDotTiles(), "n_dot_tiles");
+}
