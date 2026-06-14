@@ -164,6 +164,12 @@ void CollapseAddressSpacePass::runOnOperation() {
       if (passthroughAttr)
         newFuncOp->setAttr("passthrough", passthroughAttr);
 
+      // Preserve the target_features attribute (e.g. "+hmx,+hmxv73" set by the
+      // HexKL HMX core-dot lowering); it is load-bearing for HMX instruction
+      // selection and must survive the func-signature rewrite.
+      if (auto tf = funcOp.getTargetFeaturesAttr())
+        newFuncOp.setTargetFeaturesAttr(tf);
+
       // Move the body from the old function to the new one
       if (!funcOp.getBody().empty()) {
         newFuncOp.getBody().takeBody(funcOp.getBody());

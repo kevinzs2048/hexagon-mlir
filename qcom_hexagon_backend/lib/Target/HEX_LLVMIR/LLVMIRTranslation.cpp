@@ -174,8 +174,34 @@ static std::unique_ptr<llvm::Module> translateLLVMToLLVMIR(
   }
   llvmModule->setTargetTriple(llvm::Triple(arch_kwargs.at("arch_triple")));
   llvmModule->setDataLayout(arch_kwargs.at("data_layout"));
-  for (llvm::Function &f : llvmModule->functions())
-    f.addFnAttr("target-features", arch_kwargs.at("arch_features"));
+  const std::string &archFeatures = arch_kwargs.at("arch_features");
+  for (llvm::Function &f : llvmModule->functions()) {
+    // Preserve any per-function "target-features" already set upstream (e.g. the
+    // HexKL HMX core-dot lowering tags its kernel with "+hmx,+hmxv73", which is
+    // load-bearing for HMX instruction selection). addFnAttr overwrites, so we
+    // merge the module-default arch features in rather than clobber the
+    // existing set.
+    if (f.hasFnAttribute("target-features")) {
+      llvm::StringRef existing =
+          f.getFnAttribute("target-features").getValueAsString();
+      llvm::SmallVector<llvm::StringRef> have;
+      existing.split(have, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+      std::string merged(existing);
+      llvm::SmallVector<llvm::StringRef> want;
+      llvm::StringRef(archFeatures)
+          .split(want, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+      for (llvm::StringRef feat : want) {
+        if (!llvm::is_contained(have, feat)) {
+          if (!merged.empty())
+            merged += ",";
+          merged += feat.str();
+        }
+      }
+      f.addFnAttr("target-features", merged);
+    } else {
+      f.addFnAttr("target-features", archFeatures);
+    }
+  }
 
   if (optLevel != LLVMOptimizationLevel::NoOptimization) {
     auto optPipeline = mlir::makeOptimizingTransformer(
