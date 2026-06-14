@@ -152,9 +152,32 @@ LogicalResult MicroHMXCopyF16ToF32SubmatrixOp::verify() {
                            "output_cols");
 }
 
+/// Verify a statically-known memref dimension is a multiple of `mult`.
+/// No-op when the dimension is dynamic (the multiple is then a runtime
+/// precondition the caller must uphold).
+static LogicalResult verifyStaticDimMultiple(Operation *op, Value memref,
+                                             unsigned dim, int64_t mult,
+                                             StringRef name) {
+  auto t = dyn_cast<MemRefType>(memref.getType());
+  if (!t || !t.hasRank() || dim >= t.getRank())
+    return success();
+  int64_t d = t.getDimSize(dim);
+  if (ShapedType::isDynamic(d))
+    return success();
+  if (d % mult != 0)
+    return op->emitOpError()
+           << name << " (" << d << ") must be a multiple of " << mult;
+  return success();
+}
+
 LogicalResult HvxLayoutWeightOp::verify() {
   Operation *op = getOperation();
   if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
+    return failure();
+
+  // src is [K][N]; the pair-tile vscatter requires K%32==0 and N%64==0.
+  if (failed(verifyStaticDimMultiple(op, getSrc(), 0, 32, "K")) ||
+      failed(verifyStaticDimMultiple(op, getSrc(), 1, 64, "N")))
     return failure();
 
   return verifyNonNegative(op, getWtOff(), "wt_off", getK(), "k", getN(), "n");
@@ -165,12 +188,22 @@ LogicalResult HvxLayoutActivationOp::verify() {
   if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
     return failure();
 
+  // src is [M][K]; the pair-tile vscatter requires M%32==0 and K%64==0.
+  if (failed(verifyStaticDimMultiple(op, getSrc(), 0, 32, "M")) ||
+      failed(verifyStaticDimMultiple(op, getSrc(), 1, 64, "K")))
+    return failure();
+
   return verifyNonNegative(op, getActOff(), "act_off", getM(), "m", getK(), "k");
 }
 
 LogicalResult HvxReadoutOp::verify() {
   Operation *op = getOperation();
   if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
+    return failure();
+
+  // dst is [M][N]; the gather/widen requires M%32==0 and N%32==0.
+  if (failed(verifyStaticDimMultiple(op, getDst(), 0, 32, "M")) ||
+      failed(verifyStaticDimMultiple(op, getDst(), 1, 32, "N")))
     return failure();
 
   return verifyNonNegative(op, getOutOff(), "out_off", getScratchOff(),
