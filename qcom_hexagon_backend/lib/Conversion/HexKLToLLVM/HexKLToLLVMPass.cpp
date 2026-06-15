@@ -988,6 +988,283 @@ struct LowerHvxLayoutWeight
 };
 
 //===----------------------------------------------------------------------===//
+// Lower hexkl::HvxLayoutWeightQ8Op -> fused HVX dequant + transposing vscatter
+//===----------------------------------------------------------------------===//
+//
+// Emits the inline-HVX equivalent of the hand-written baseline
+// dequantize_x4x2_weight_to_fp16_tiles_task_q8_0 (hmx-matmul-ops.c:667). The
+// weight is consumed in its NATURAL q8x4x2 [N][row_stride] orientation (N rows;
+// each row = K int8 quants then K/32 fp16 group scales), so the slow scalar
+// [N][K]->[K][N] dequant+transpose that profiling pinned at ~99% of per-call
+// cost is gone: the transpose happens for free inside the vscatter offset table
+// (hmx_transpose_scatter_offsets[i] = i*128), exactly like the baseline.
+//
+// Per output weight tile t (ct = t/n_k_tiles = N-tile, kt = t%n_k_tiles =
+// K-tile; tile order [nt][kt] matches hmx_core_dot's column loop):
+//   tile_base = wtBase + t*2048
+//   blk_idx = (kt*32)/256 ; sub_blk = ((kt*32)%256)/32
+//   byte_off  = blk_idx*256 + sub_blk*32       (this K-tile's quant byte offset)
+//   scale_off = K + blk_idx*16 + sub_blk*2     (this K-tile's fp16 scale offset)
+//   v_off = [i*128]                            (32-lane word-offset table)
+//   for r in 0..32 step 2:
+//     row0 = ct*32 + r ; row1 = row0+1
+//     v0 = dequant(q8_src + row0*row_stride + byte_off, ...+scale_off)
+//     v1 = dequant(q8_src + row1*row_stride + byte_off, ...+scale_off)
+//     vscattermwq(pred64, tile_base, 2047, v_off, v0); v_off += 4
+//     vscattermwq(pred64, tile_base, 2047, v_off, v1); v_off += 4
+//
+// dequant(qptr, sptr) -> 32 fp16 (in the low 64 bytes), mirroring
+// dequantize_x4x2_q8_0_group_hvx (hmx-matmul-ops.c:335):
+//   vq    = load <32xi32> (32 int8 in the low 32 bytes)
+//   v16   = lo(vunpackb(vq))         int8 -> int16
+//   v_hf  = vconv_hf_h(v16)          int16 -> fp16
+//   vsc   = lvsplatw(s | s<<16)      splat the group's fp16 scale to all lanes
+//   ret   = vconv_hf_qf16(vmpy_qf16_hf(v_hf, vsc))   (* scale -> fp16)
+//
+// The masked WORD scatter (vscattermwq, region 2047, pred = first 64 bytes =
+// 16 words) writes 16 words = 32 fp16 per call to byte offsets i*128 (+4*r for
+// the column) -- byte-for-byte the baseline Q6_vscatter_QRMVwV scheme. All
+// intrinsics here are HVX (LLVM-22-native), unlike the LLVM-19-only HMX ones.
+
+static constexpr StringRef kHvxScatterWq = "llvm.hexagon.V6.vscattermwq.128B";
+static constexpr StringRef kHvxPredScalar2 = "llvm.hexagon.V6.pred_scalar2.128B";
+static constexpr StringRef kHvxVunpackB = "llvm.hexagon.V6.vunpackb.128B";
+static constexpr StringRef kHvxLo = "llvm.hexagon.V6.lo.128B";
+static constexpr StringRef kHvxConvHfH = "llvm.hexagon.V6.vconv.hf.h.128B";
+static constexpr StringRef kHvxConvHfQf16 =
+    "llvm.hexagon.V6.vconv.hf.qf16.128B";
+static constexpr StringRef kHvxMpyQf16Hf = "llvm.hexagon.V6.vmpy.qf16.hf.128B";
+static constexpr StringRef kHvxLvsplatw = "llvm.hexagon.V6.lvsplatw.128B";
+
+struct LowerHvxLayoutWeightQ8
+    : public ConvertOpToLLVMPattern<hexkl::HvxLayoutWeightQ8Op> {
+  using ConvertOpToLLVMPattern<
+      hexkl::HvxLayoutWeightQ8Op>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(hexkl::HvxLayoutWeightQ8Op op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    MLIRContext *ctx = rewriter.getContext();
+
+    auto i16Ty = rewriter.getI16Type();
+    auto i32Ty = rewriter.getI32Type();
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+    auto i8Ty = rewriter.getI8Type();
+    auto v128i1 = VectorType::get({128}, rewriter.getI1Type());
+    auto v32i32 = VectorType::get({32}, i32Ty);
+    auto v64i32 = VectorType::get({64}, i32Ty);
+
+    // Tag the enclosing llvm.func with HVX features (merge, preserve siblings).
+    if (auto enclosing = op->getParentOfType<LLVM::LLVMFuncOp>()) {
+      llvm::SmallVector<StringRef> feats;
+      if (auto existing = enclosing.getTargetFeaturesAttr())
+        for (StringRef f : existing.getFeatures())
+          feats.push_back(f);
+      for (StringRef want : {StringRef("+hvxv73"), StringRef("+hvx-length128b")})
+        if (!llvm::is_contained(feats, want))
+          feats.push_back(want);
+      enclosing.setTargetFeaturesAttr(
+          LLVM::TargetFeaturesAttr::get(ctx, feats));
+    }
+
+    // --- Declare the HVX intrinsics used (lazily). ---
+    auto scatFn = declareHmxIntrinsic(module, rewriter, kHvxScatterWq,
+                                      {v128i1, i32Ty, i32Ty, v32i32, v32i32},
+                                      voidTy);
+    auto predFn = declareHmxIntrinsic(module, rewriter, kHvxPredScalar2,
+                                      {i32Ty}, v128i1);
+    auto unpackFn = declareHmxIntrinsic(module, rewriter, kHvxVunpackB,
+                                        {v32i32}, v64i32);
+    auto loFn =
+        declareHmxIntrinsic(module, rewriter, kHvxLo, {v64i32}, v32i32);
+    auto convHfHFn = declareHmxIntrinsic(module, rewriter, kHvxConvHfH,
+                                         {v32i32}, v32i32);
+    auto convHfQf16Fn = declareHmxIntrinsic(module, rewriter, kHvxConvHfQf16,
+                                            {v32i32}, v32i32);
+    auto mpyFn = declareHmxIntrinsic(module, rewriter, kHvxMpyQf16Hf,
+                                     {v32i32, v32i32}, v32i32);
+    auto splatFn = declareHmxIntrinsic(module, rewriter, kHvxLvsplatw,
+                                       {i32Ty}, v32i32);
+    if (failed(scatFn) || failed(predFn) || failed(unpackFn) || failed(loFn) ||
+        failed(convHfHFn) || failed(convHfQf16Fn) || failed(mpyFn) ||
+        failed(splatFn))
+      return failure();
+
+    auto cst = [&](int64_t v) -> Value {
+      return rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
+                                               rewriter.getI32IntegerAttr(v));
+    };
+    auto gepI8 = [&](Value base, Value byteOff) -> Value {
+      return rewriter.create<LLVM::GEPOp>(loc, ptrTy, i8Ty, base,
+                                          ValueRange{byteOff});
+    };
+    auto call1 = [&](FailureOr<FlatSymbolRefAttr> fn, Type retTy,
+                     ValueRange args) -> Value {
+      return rewriter.create<LLVM::CallOp>(loc, TypeRange{retTy}, *fn, args)
+          .getResult();
+    };
+
+    // --- Constants. ---
+    Value c0 = cst(0);
+    Value c1 = cst(1);
+    Value c2 = cst(2);
+    Value c4 = cst(4);
+    Value c16 = cst(16);
+    Value c32 = cst(32);
+    Value c64 = cst(64);
+    Value c128 = cst(128);
+    Value c256 = cst(256);
+    Value c2048 = cst(kHmxTileBytes);
+    Value region = cst(kHmxTileBytes - 1); // 2047
+
+    // hmx_transpose_scatter_offsets: <32xi32> word table, lane i = i*128.
+    SmallVector<int32_t, 32> scatOffVals(32);
+    for (int i = 0; i < 32; ++i)
+      scatOffVals[i] = i * 128;
+    Value vScatBase = rewriter.create<LLVM::ConstantOp>(
+        loc, v32i32, DenseElementsAttr::get(v32i32, ArrayRef<int32_t>(scatOffVals)));
+    // splat(4) for the per-row column advance.
+    SmallVector<int32_t, 32> fourVals(32, 4);
+    Value vStep4 = rewriter.create<LLVM::ConstantOp>(
+        loc, v32i32, DenseElementsAttr::get(v32i32, ArrayRef<int32_t>(fourVals)));
+
+    // Loop-invariant scatter predicate: first 64 bytes (= 16 words) active.
+    Value pred64 = call1(predFn, v128i1, ValueRange{c64});
+
+    // --- Operands / derived scalars. ---
+    Value vtcmBase = alignedPtr(rewriter, loc, adaptor.getHmxBlock());
+    Value q8Base = alignedPtr(rewriter, loc, adaptor.getQ8Src());
+    Value wtOff = adaptor.getWtOff();
+    Value K = adaptor.getK();
+    Value N = adaptor.getN();
+
+    Value nKTiles = rewriter.create<LLVM::SDivOp>(loc, K, c32); // K/32
+    Value nNTiles = rewriter.create<LLVM::SDivOp>(loc, N, c32); // N/32
+    Value nOutTiles = rewriter.create<LLVM::MulOp>(loc, nNTiles, nKTiles);
+    // row_stride = K + (K/32)*2 bytes.
+    Value scalesBytes = rewriter.create<LLVM::MulOp>(loc, nKTiles, c2);
+    Value rowStride = rewriter.create<LLVM::AddOp>(loc, K, scalesBytes);
+    // wtBase = vtcm + wt_off.
+    Value wtBase = gepI8(vtcmBase, wtOff);
+
+    // ---- Outer loop over output tiles t in [0, nOutTiles) ----
+    Block *origBlock = rewriter.getInsertionBlock();
+    Block *contBlock =
+        rewriter.splitBlock(origBlock, rewriter.getInsertionPoint());
+
+    Block *tHeader = rewriter.createBlock(contBlock, {i32Ty}, {loc});
+    Block *tBody = rewriter.createBlock(contBlock);
+
+    rewriter.setInsertionPointToEnd(origBlock);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, tHeader);
+
+    // t header
+    rewriter.setInsertionPointToEnd(tHeader);
+    Value t = tHeader->getArgument(0);
+    Value tCond = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt,
+                                                t, nOutTiles);
+    rewriter.create<LLVM::CondBrOp>(loc, tCond, tBody, ValueRange{}, contBlock,
+                                    ValueRange{});
+
+    // t body: derive ct, kt, byte/scale offsets, tile_base, then enter r-loop.
+    rewriter.setInsertionPointToEnd(tBody);
+    Value ct = rewriter.create<LLVM::SDivOp>(loc, t, nKTiles);
+    Value kt = rewriter.create<LLVM::SRemOp>(loc, t, nKTiles);
+    // blk_idx = (kt*32)/256 ; sub_blk = ((kt*32)%256)/32
+    Value kt32 = rewriter.create<LLVM::MulOp>(loc, kt, c32);
+    Value blkIdx = rewriter.create<LLVM::SDivOp>(loc, kt32, c256);
+    Value kt32Mod = rewriter.create<LLVM::SRemOp>(loc, kt32, c256);
+    Value subBlk = rewriter.create<LLVM::SDivOp>(loc, kt32Mod, c32);
+    // byte_off  = blk_idx*256 + sub_blk*32
+    Value bi256 = rewriter.create<LLVM::MulOp>(loc, blkIdx, c256);
+    Value sb32 = rewriter.create<LLVM::MulOp>(loc, subBlk, c32);
+    Value byteOff = rewriter.create<LLVM::AddOp>(loc, bi256, sb32);
+    // scale_off = K + blk_idx*16 + sub_blk*2
+    Value bi16 = rewriter.create<LLVM::MulOp>(loc, blkIdx, c16);
+    Value sb2 = rewriter.create<LLVM::MulOp>(loc, subBlk, c2);
+    Value scaleOff0 = rewriter.create<LLVM::AddOp>(loc, K, bi16);
+    Value scaleOff = rewriter.create<LLVM::AddOp>(loc, scaleOff0, sb2);
+    // tile_base addr (i32) = ptrtoint(wtBase + t*2048)
+    Value tBytes = rewriter.create<LLVM::MulOp>(loc, t, c2048);
+    Value tilePtr = gepI8(wtBase, tBytes);
+    Value tileAddr = rewriter.create<LLVM::PtrToIntOp>(loc, i32Ty, tilePtr);
+    // base global row for this N-tile = ct*32
+    Value ctRowBase = rewriter.create<LLVM::MulOp>(loc, ct, c32);
+
+    // ---- r loop ----  carries (r, v_off:<32xi32>)
+    Block *rHeader =
+        rewriter.createBlock(contBlock, {i32Ty, v32i32}, {loc, loc});
+    Block *rBody = rewriter.createBlock(contBlock);
+    Block *tLatch = rewriter.createBlock(contBlock);
+
+    rewriter.setInsertionPointToEnd(tBody);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0, vScatBase}, rHeader);
+
+    // r header
+    rewriter.setInsertionPointToEnd(rHeader);
+    Value r = rHeader->getArgument(0);
+    Value vOff = rHeader->getArgument(1);
+    Value rCond = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt,
+                                                r, c32);
+    rewriter.create<LLVM::CondBrOp>(loc, rCond, rBody, ValueRange{}, tLatch,
+                                    ValueRange{});
+
+    // t latch: t++ ; back to t header
+    rewriter.setInsertionPointToEnd(tLatch);
+    Value tNext = rewriter.create<LLVM::AddOp>(loc, t, c1);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{tNext}, tHeader);
+
+    // r body: dequant the two rows, scatter, advance v_off twice, r += 2.
+    rewriter.setInsertionPointToEnd(rBody);
+    // dequant helper: given a row pointer base, returns the 32-fp16 <32xi32>.
+    auto dequantRow = [&](Value rowPtr) -> Value {
+      Value qPtr = gepI8(rowPtr, byteOff);
+      Value sPtr = gepI8(rowPtr, scaleOff);
+      // vq = load <32xi32> (32 int8 in low 32 bytes), unaligned (align 1).
+      Value vq = rewriter.create<LLVM::LoadOp>(loc, v32i32, qPtr, /*align=*/1)
+                     .getResult();
+      Value vpair = call1(unpackFn, v64i32, ValueRange{vq});
+      Value v16 = call1(loFn, v32i32, ValueRange{vpair});
+      Value vHf = call1(convHfHFn, v32i32, ValueRange{v16});
+      // splat the group's fp16 scale: load i16, zext i32, pack (s | s<<16).
+      Value s16 = rewriter.create<LLVM::LoadOp>(loc, i16Ty, sPtr, /*align=*/1)
+                      .getResult();
+      Value s32 = rewriter.create<LLVM::ZExtOp>(loc, i32Ty, s16);
+      Value sHi = rewriter.create<LLVM::ShlOp>(loc, s32, c16);
+      Value sPacked = rewriter.create<LLVM::OrOp>(loc, s32, sHi);
+      Value vScales = call1(splatFn, v32i32, ValueRange{sPacked});
+      Value prod = call1(mpyFn, v32i32, ValueRange{vHf, vScales});
+      return call1(convHfQf16Fn, v32i32, ValueRange{prod});
+    };
+
+    Value row0 = rewriter.create<LLVM::AddOp>(loc, ctRowBase, r);
+    Value row1 = rewriter.create<LLVM::AddOp>(loc, row0, c1);
+    Value off0 = rewriter.create<LLVM::MulOp>(loc, row0, rowStride);
+    Value off1 = rewriter.create<LLVM::MulOp>(loc, row1, rowStride);
+    Value rowPtr0 = gepI8(q8Base, off0);
+    Value rowPtr1 = gepI8(q8Base, off1);
+    Value v0 = dequantRow(rowPtr0);
+    Value v1 = dequantRow(rowPtr1);
+
+    rewriter.create<LLVM::CallOp>(
+        loc, TypeRange{}, *scatFn,
+        ValueRange{pred64, tileAddr, region, vOff, v0});
+    Value vOff1 = rewriter.create<LLVM::AddOp>(loc, vOff, vStep4);
+    rewriter.create<LLVM::CallOp>(
+        loc, TypeRange{}, *scatFn,
+        ValueRange{pred64, tileAddr, region, vOff1, v1});
+    Value vOff2 = rewriter.create<LLVM::AddOp>(loc, vOff1, vStep4);
+    Value rNext = rewriter.create<LLVM::AddOp>(loc, r, c2);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{rNext, vOff2}, rHeader);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Lower hexkl::HvxLayoutActivationOp -> inline HVX vscattermhw activation-half
 //===----------------------------------------------------------------------===//
 //
@@ -1456,6 +1733,8 @@ void populateHexKLToLLVMConversionPatterns(LLVMTypeConverter &converter,
   patterns.add<LowerHmxCoreDot>(converter);
   // Lower the fast HVX weight-half layout to inline vscatter.
   patterns.add<LowerHvxLayoutWeight>(converter);
+  // Lower the fused Q8 dequant + weight-half layout to inline HVX.
+  patterns.add<LowerHvxLayoutWeightQ8>(converter);
   // Lower the fast HVX activation-half layout + accumulator readout.
   patterns.add<LowerHvxLayoutActivation, LowerHvxReadout>(converter);
 }
