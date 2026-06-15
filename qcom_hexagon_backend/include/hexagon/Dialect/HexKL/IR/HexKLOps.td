@@ -294,6 +294,46 @@ def HexKL_HvxLayoutWeightOp
     "`(` $hmx_block `,` $wt_off `,` $src `,` $k `,` $n `)` `:` type($hmx_block) `,` type($wt_off) `,` type($src) `,` type($k) `,` type($n) attr-dict";
 }
 
+def HexKL_HvxLayoutWeightQ8Op
+  : HexKL_Op<"hvx_layout_weight_q8",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+
+  let summary = "Fast HVX Q8_0 weight-half tile layout via fused dequant+vscatter";
+  let description = [{
+    Lays out a Q8_0 (q8x4x2) quantized weight `[N][row_stride]` (resident in
+    DDR or VTCM) into the HMX weight-half tile format, writing to the VTCM
+    `hmx_block` at `wt_off`, fusing the int8->fp16 dequantization (inline HVX)
+    with the transposing vscatter. Mirrors the hand-written baseline
+    `dequantize_x4x2_weight_to_fp16_tiles_task_q8_0`: it reads the weight in its
+    NATURAL `[N][K]` orientation (N rows, K contiguous quants per row) — NO
+    separate `[N][K]->[K][N]` transpose, which is the slow scalar phase this op
+    eliminates.
+
+    `q8_src` is the q8x4x2 weight `[N][row_stride]` where each row is
+    `K` int8 quants (natural order) followed by `K/32` fp16 group scales
+    (natural order); `row_stride = K + (K/32)*2` bytes. For each output tile the
+    32 int8 quants of a K-group are widened to int16, converted to fp16, and
+    multiplied by the group's fp16 scale (all HVX), then word-scattered (masked,
+    region 2047) into the weight-half tile using the `i*128` transpose offsets.
+
+    K must be a multiple of 32; N must be a multiple of 64.
+  }];
+
+  let arguments = (ins
+    AnyNon0RankedMemRef:$hmx_block,
+    I32:$wt_off,
+    AnyNon0RankedMemRef:$q8_src,
+    I32:$k,
+    I32:$n
+  );
+
+  let results = (outs);
+
+  let assemblyFormat =
+    "`(` $hmx_block `,` $wt_off `,` $q8_src `,` $k `,` $n `)` `:` type($hmx_block) `,` type($wt_off) `,` type($q8_src) `,` type($k) `,` type($n) attr-dict";
+}
+
 def HexKL_HvxLayoutActivationOp
   : HexKL_Op<"hvx_layout_activation",
       [MemoryEffects<[MemRead, MemWrite]>]> {

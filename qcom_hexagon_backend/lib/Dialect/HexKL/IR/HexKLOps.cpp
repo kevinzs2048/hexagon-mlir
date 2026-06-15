@@ -183,6 +183,21 @@ LogicalResult HvxLayoutWeightOp::verify() {
   return verifyNonNegative(op, getWtOff(), "wt_off", getK(), "k", getN(), "n");
 }
 
+LogicalResult HvxLayoutWeightQ8Op::verify() {
+  Operation *op = getOperation();
+  if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
+    return failure();
+
+  // q8_src is [N][row_stride]; the pair-tile vscatter requires N%64==0. K is
+  // carried as a scalar operand (the q8x4x2 row interleaves quants+scales so
+  // the contraction dim is not a static memref dim) and validated as K%32 at
+  // the call site / lowering (k must be a multiple of 32).
+  if (failed(verifyStaticDimMultiple(op, getQ8Src(), 0, 64, "N")))
+    return failure();
+
+  return verifyNonNegative(op, getWtOff(), "wt_off", getK(), "k", getN(), "n");
+}
+
 LogicalResult HvxLayoutActivationOp::verify() {
   Operation *op = getOperation();
   if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
