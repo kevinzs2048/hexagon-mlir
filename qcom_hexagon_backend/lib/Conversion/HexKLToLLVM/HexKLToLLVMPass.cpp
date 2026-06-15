@@ -1027,7 +1027,13 @@ struct LowerHvxLayoutWeight
 // intrinsics here are HVX (LLVM-22-native), unlike the LLVM-19-only HMX ones.
 
 static constexpr StringRef kHvxScatterWq = "llvm.hexagon.V6.vscattermwq.128B";
-static constexpr StringRef kHvxPredScalar2 = "llvm.hexagon.V6.pred_scalar2.128B";
+// NOTE: the canonical intrinsic name is "pred.scalar2" (dot), not
+// "pred_scalar2" (underscore). With the underscore form LLVM does NOT recognize
+// it as an intrinsic -- it becomes an unknown external returning <128 x i1>,
+// whose result is materialized as a real value and spilled to the stack, which
+// the Hexagon backend cannot reload ("Cannot select: load (s128) from %stack").
+// The dotted name lowers directly to a Q predicate register (no spill).
+static constexpr StringRef kHvxPredScalar2 = "llvm.hexagon.V6.pred.scalar2.128B";
 static constexpr StringRef kHvxVunpackB = "llvm.hexagon.V6.vunpackb.128B";
 static constexpr StringRef kHvxLo = "llvm.hexagon.V6.lo.128B";
 static constexpr StringRef kHvxConvHfH = "llvm.hexagon.V6.vconv.hf.h.128B";
@@ -1130,8 +1136,11 @@ struct LowerHvxLayoutWeightQ8
     Value vStep4 = rewriter.create<LLVM::ConstantOp>(
         loc, v32i32, DenseElementsAttr::get(v32i32, ArrayRef<int32_t>(fourVals)));
 
-    // Loop-invariant scatter predicate: first 64 bytes (= 16 words) active.
-    Value pred64 = call1(predFn, v128i1, ValueRange{c64});
+    // NOTE: the scatter predicate (<128xi1>) is recomputed inside the r-loop
+    // body, NOT hoisted here: a loop-invariant v128i1 value gets spilled across
+    // the loop edge, and the LLVM-19 Hexagon backend cannot select a v128i1
+    // stack reload ("Cannot select: load (s128) from %stack"). pred_scalar2 is a
+    // single cheap instruction, so recomputing it per iteration is free.
 
     // --- Operands / derived scalars. ---
     Value vtcmBase = alignedPtr(rewriter, loc, adaptor.getHmxBlock());
@@ -1248,6 +1257,10 @@ struct LowerHvxLayoutWeightQ8
     Value v0 = dequantRow(rowPtr0);
     Value v1 = dequantRow(rowPtr1);
 
+    // Scatter predicate: first 64 bytes (= 16 words) active. Recomputed here in
+    // the loop body (see note above) so it is never spilled as a v128i1 stack
+    // value, which LLVM-19 Hexagon ISel cannot select.
+    Value pred64 = call1(predFn, v128i1, ValueRange{c64});
     rewriter.create<LLVM::CallOp>(
         loc, TypeRange{}, *scatFn,
         ValueRange{pred64, tileAddr, region, vOff, v0});
