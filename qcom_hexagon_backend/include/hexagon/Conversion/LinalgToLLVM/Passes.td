@@ -92,6 +92,10 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           /*default=*/"false",
           "Route hexkl.matmul decomposition to the inline hexkl.hmx_core_dot "
           "op instead of per-tile micro HMX ops">,
+    Option<"enableQ8Weight", "enable-q8-weight", "bool",
+          /*default=*/"false",
+          "In the inline-HMX path, fuse Q8_0 int8->fp16 dequant into the weight "
+          "layout over a q8x4x2 i8 weight argument (hvx_layout_weight_q8)">,
     Option<"enableCollapseAddressSpace", "enable-collapse-address-space", "bool",
           /*default=*/"true",
           "replace llvm.ptr<1> with llvm.ptr at last stage of convert-to-llvm">,

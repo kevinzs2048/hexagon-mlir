@@ -343,6 +343,7 @@ public:
     if (enableHexKL) {
       DecomposeHexKLMatmulOptions decomposeOpts;
       decomposeOpts.useInlineHMX = enableInlineHMX;
+      decomposeOpts.enableQ8Weight = enableQ8Weight;
       pm.addNestedPass<func::FuncOp>(
           createDecomposeHexKLMatmulPass(decomposeOpts));
     }

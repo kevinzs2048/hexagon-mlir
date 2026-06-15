@@ -38,10 +38,12 @@ using namespace hexagon;
 namespace {
 
 struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
-  DecomposeHexKLMatmul(MLIRContext *ctx, bool useInlineHMX)
-      : OpRewritePattern(ctx), useInlineHMX(useInlineHMX) {}
+  DecomposeHexKLMatmul(MLIRContext *ctx, bool useInlineHMX, bool enableQ8Weight)
+      : OpRewritePattern(ctx), useInlineHMX(useInlineHMX),
+        enableQ8Weight(enableQ8Weight) {}
 
   bool useInlineHMX = false;
+  bool enableQ8Weight = false;
 
   LogicalResult matchAndRewrite(hexkl::MatmulOp op,
                                 PatternRewriter &rewriter) const override {
@@ -247,6 +249,29 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     return success();
   }
 
+  // Find the Q8 weight buffer for the enableQ8Weight path: the i8-element
+  // ranked memref argument of the enclosing func. The fp16 matmul rhs only
+  // carries the K/N dims; the actual quantized weight data is passed as a
+  // separate i8 [N][row_stride] kernel argument (the matmul op type system
+  // requires a fp16 rhs, so the Q8 buffer cannot be the rhs itself).
+  static Value findQ8WeightArg(hexkl::MatmulOp op) {
+    auto func = op->getParentOfType<FunctionOpInterface>();
+    if (!func)
+      return nullptr;
+    Value found;
+    for (Value arg : func.getArguments()) {
+      auto mt = dyn_cast<MemRefType>(arg.getType());
+      if (!mt)
+        continue;
+      if (mt.getElementType().isInteger(8)) {
+        if (found) // ambiguous: more than one i8 memref arg
+          return nullptr;
+        found = arg;
+      }
+    }
+    return found;
+  }
+
   // Inline-HMX decomposition: all-resident VTCM arena + one hexkl.hmx_core_dot.
   // Mirrors the proven hmx-spike pipeline (spike_main.cpp / spike_layout.c /
   // spike_dequant.c / spike_hmx_mm.c):
@@ -336,7 +361,26 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     // row-major directly (NO transpose) and writes tile (nt,kt) at
     // wtOff + (nt*n_k_tiles+kt)*2048 -- the order hmx_core_dot's col loop
     // expects (spike T8 weight-tile-order fix). Byte-identical output.
-    rewriter.create<hexkl::HvxLayoutWeightOp>(loc, vtcm, wtOffI32, rhs, K, N);
+    //
+    // Q8-weight path (flag-gated, default off): instead of laying out a
+    // pre-dequantized fp16 [K][N] weight, fuse the int8->fp16 dequant into the
+    // layout by emitting hvx_layout_weight_q8 over the q8x4x2 weight in its
+    // natural [N][row_stride] orientation -- eliminating the slow scalar
+    // [N][K]->[K][N] dequant+transpose. The Q8 i8 weight is supplied as an extra
+    // i8 memref argument on the kernel func (the fp16 rhs still carries K/N for
+    // hmx_core_dot's tile counts). act layout / hmx_core_dot / readout are
+    // unchanged, so the default fp16 path is byte-identical when the flag is off.
+    if (enableQ8Weight) {
+      Value q8Src = findQ8WeightArg(op);
+      if (!q8Src)
+        return rewriter.notifyMatchFailure(
+            op, "enableQ8Weight: no i8 weight memref argument found on the "
+                "enclosing func");
+      rewriter.create<hexkl::HvxLayoutWeightQ8Op>(loc, vtcm, wtOffI32, q8Src, K,
+                                                  N);
+    } else {
+      rewriter.create<hexkl::HvxLayoutWeightOp>(loc, vtcm, wtOffI32, rhs, K, N);
+    }
 
     // --- 4. init bias struct in the bias tile ---
     // HMX scale/bias structure for Q6_bias_mxmem2_A: first 32 i32 lanes =
@@ -389,8 +433,10 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
 };
 
 void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns,
-                                          bool useInlineHMX) {
-  patterns.add<DecomposeHexKLMatmul>(patterns.getContext(), useInlineHMX);
+                                          bool useInlineHMX,
+                                          bool enableQ8Weight) {
+  patterns.add<DecomposeHexKLMatmul>(patterns.getContext(), useInlineHMX,
+                                     enableQ8Weight);
 }
 
 struct DecomposeHexKLMatmulPass
@@ -407,7 +453,7 @@ struct DecomposeHexKLMatmulPass
 
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
-    populateDecomposeHexKLMatmulPatterns(patterns, useInlineHMX);
+    populateDecomposeHexKLMatmulPatterns(patterns, useInlineHMX, enableQ8Weight);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

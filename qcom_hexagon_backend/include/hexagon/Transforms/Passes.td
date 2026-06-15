@@ -255,6 +255,11 @@ def DecomposeHexKLMatmul :
           /*default=*/"false",
           "decompose matmul to the inline hexkl.hmx_core_dot op instead of "
           "per-tile micro HMX ops">,
+    Option<"enableQ8Weight", "enable-q8-weight", "bool",
+          /*default=*/"false",
+          "in the inline-HMX path, fuse Q8_0 int8->fp16 dequant into the weight "
+          "layout (hvx_layout_weight_q8) over a q8x4x2 [N][row_stride] i8 weight "
+          "argument, instead of laying out a pre-dequantized fp16 [K][N] weight">,
   ];
   let constructor = "hexagon::createDecomposeHexKLMatmulPass()";
 }
