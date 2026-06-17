@@ -903,18 +903,9 @@ struct LowerMatmulVrmpyQ8
     Value nb = rewriter.create<LLVM::SDivOp>(loc, K, c1024);
     Value zeroVec = call1(vd0Fn, v32i32, ValueRange{});
 
-    // 8x vrmpybv + butterfly reduce -> <32xi32> int32 (mirrors
-    // hvx_vec_rmpy_x8_full). aBase/wBase point at the super-block's int8.
-    auto rmpyBlock = [&](Value aBlk, Value wBlk) -> Value {
-      Value a[8], w[8], r[8];
-      for (int i = 0; i < 8; i++) {
-        Value off = cst(i * 128);
-        a[i] = loadVec(aBlk, off);
-        w[i] = loadVec(wBlk, off);
-      }
-      for (int i = 0; i < 8; i++)
-        r[i] = call1(vrmpyFn, v32i32, ValueRange{w[i], a[i]});
-      // level 1: pair (r1,r0),(r3,r2),(r5,r4),(r7,r6)
+    // butterfly reduce of 8 vrmpybv results -> <32xi32> int32 (mirrors
+    // hvx_vec_rmpy_x8_full tail).
+    auto butterfly = [&](Value r[8]) -> Value {
       auto deal = [&](Value hi, Value lo) -> Value {
         Value p = call1(vdealFn, v64i32, ValueRange{hi, lo, cst(-4)});
         Value plo = call1(loFn, v32i32, ValueRange{p});
@@ -925,11 +916,58 @@ struct LowerMatmulVrmpyQ8
       Value l1 = deal(r[3], r[2]);
       Value l2 = deal(r[5], r[4]);
       Value l3 = deal(r[7], r[6]);
-      // level 2
       Value m0 = deal(l1, l0);
       Value m1 = deal(l3, l2);
-      // level 3
       return deal(m1, m0);
+    };
+    // Load 8 act HVX vectors from a super-block (shared across weight rows).
+    auto loadAct8 = [&](Value aBlk, Value a[8]) {
+      for (int i = 0; i < 8; i++)
+        a[i] = loadVec(aBlk, cst(i * 128));
+    };
+    // 8x vrmpybv (one weight row against pre-loaded act) + butterfly -> int32.
+    auto rmpyRow = [&](Value a[8], Value wBlk) -> Value {
+      Value r[8];
+      for (int i = 0; i < 8; i++) {
+        Value w = loadVec(wBlk, cst(i * 128));
+        r[i] = call1(vrmpyFn, v32i32, ValueRange{w, a[i]});
+      }
+      return butterfly(r);
+    };
+    // 8x vrmpybv + butterfly reduce, loading both operands (1x1 tail path).
+    auto rmpyBlock = [&](Value aBlk, Value wBlk) -> Value {
+      Value a[8];
+      loadAct8(aBlk, a);
+      return rmpyRow(a, wBlk);
+    };
+    // Combined-scale + scale-after-accumulate for one super-block: given the
+    // int32 dot, the (already-vshuff'd) shared act scale, and the weight-row
+    // scale offset, return the new qf32->sf accumulator.
+    auto scaleAccum = [&](Value intDot, Value aScale, Value wScaleRaw,
+                          Value sumIn) -> Value {
+      Value intDotF = call1(convSfWFn, v32i32, ValueRange{intDot});
+      Value wScale = call1(vshuffhFn, v32i32, ValueRange{wScaleRaw});
+      Value ddPair = call1(mpyQf32HfFn, v64i32, ValueRange{wScale, aScale});
+      Value ddLo = call1(loFn, v32i32, ValueRange{ddPair});
+      Value ddSf = call1(convSfQf32Fn, v32i32, ValueRange{ddLo});
+      Value fa = call1(mpyQf32SfFn, v32i32, ValueRange{intDotF, ddSf});
+      Value accQf = call1(addQf32MixFn, v32i32, ValueRange{fa, sumIn});
+      return call1(convSfQf32Fn, v32i32, ValueRange{accQf});
+    };
+    // Horizontal reduce-sum (vror/vadd.sf tree) + store lane0 to out[outIdx].
+    auto reduceStore = [&](Value sum, Value outIdx) {
+      Value red = sum;
+      for (int w = 4; w < 128; w <<= 1) {
+        Value rot = call1(vrorFn, v32i32, ValueRange{red, cst(w)});
+        Value add = call1(addSfFn, v32i32, ValueRange{red, rot});
+        red = call1(convSfQf32Fn, v32i32, ValueRange{add});
+      }
+      Value outElemPtr = rewriter.create<LLVM::GEPOp>(
+          loc, ptrTy, f32Ty, outPtr, ValueRange{outIdx});
+      Value redF = rewriter.create<LLVM::BitcastOp>(
+          loc, VectorType::get({32}, f32Ty), red);
+      Value lane0 = rewriter.create<LLVM::ExtractElementOp>(loc, redF, cst(0));
+      rewriter.create<LLVM::StoreOp>(loc, lane0, outElemPtr, /*align=*/4);
     };
 
     // ---- Build the M/N/K loop nest with explicit basic blocks. ----
@@ -950,19 +988,98 @@ struct LowerMatmulVrmpyQ8
     rewriter.create<LLVM::CondBrOp>(loc, mCond, mBody, ValueRange{}, contBlock,
                                     ValueRange{});
 
-    // m body: act row base = actPtr + m*actRowStride ; out row base (elements)
+    // m body: act row base = actPtr + m*actRowStride ; out row base (elements).
+    // nMain = (N/4)*4 = the 4-aligned N bound for the 4x1-tiled main loop.
     rewriter.setInsertionPointToEnd(mBody);
     Value mActOff = rewriter.create<LLVM::MulOp>(loc, m, actRowStride);
     Value actRowBase = gepI8(actPtr, mActOff);
     Value mOutElt = rewriter.create<LLVM::MulOp>(loc, m, outRowStrideElt);
+    Value nMainDiv = rewriter.create<LLVM::SDivOp>(loc, N, c4);
+    Value nMain = rewriter.create<LLVM::MulOp>(loc, nMainDiv, c4);
 
-    // ---- N loop ----
+    // ---- N4 main loop (step 4): 4 weight rows share one activation load ----
+    Block *n4Header = rewriter.createBlock(contBlock, {i32Ty}, {loc});
+    Block *n4Body = rewriter.createBlock(contBlock);
+    rewriter.setInsertionPointToEnd(mBody);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, n4Header);
+
+    // tail (1x1) loop + m latch declared up front (n4 falls through to tail).
     Block *nHeader = rewriter.createBlock(contBlock, {i32Ty}, {loc});
     Block *nBody = rewriter.createBlock(contBlock);
     Block *mLatch = rewriter.createBlock(contBlock);
-    rewriter.setInsertionPointToEnd(mBody);
-    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, nHeader);
 
+    rewriter.setInsertionPointToEnd(n4Header);
+    Value n4 = n4Header->getArgument(0);
+    Value n4Cond = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt,
+                                                 n4, nMain);
+    rewriter.create<LLVM::CondBrOp>(loc, n4Cond, n4Body, ValueRange{}, nHeader,
+                                    ValueRange{nMain});
+
+    // n4 body: 4 weight row bases (n4, n4+1, n4+2, n4+3) ; enter K4 loop.
+    rewriter.setInsertionPointToEnd(n4Body);
+    Value wtRowBase4[4];
+    for (int j = 0; j < 4; j++) {
+      Value nj = rewriter.create<LLVM::AddOp>(loc, n4, cst(j));
+      Value off = rewriter.create<LLVM::MulOp>(loc, nj, wtRowStride);
+      wtRowBase4[j] = gepI8(wtPtr, off);
+    }
+
+    // ---- K4 super-block loop ----  carries (i, s0,s1,s2,s3 : <32xi32>)
+    Block *k4Header = rewriter.createBlock(
+        contBlock, {i32Ty, v32i32, v32i32, v32i32, v32i32},
+        {loc, loc, loc, loc, loc});
+    Block *k4Body = rewriter.createBlock(contBlock);
+    Block *k4Exit = rewriter.createBlock(
+        contBlock, {v32i32, v32i32, v32i32, v32i32}, {loc, loc, loc, loc});
+    rewriter.setInsertionPointToEnd(n4Body);
+    rewriter.create<LLVM::BrOp>(
+        loc, ValueRange{c0, zeroVec, zeroVec, zeroVec, zeroVec}, k4Header);
+
+    rewriter.setInsertionPointToEnd(k4Header);
+    Value k4i = k4Header->getArgument(0);
+    Value s0 = k4Header->getArgument(1);
+    Value s1 = k4Header->getArgument(2);
+    Value s2 = k4Header->getArgument(3);
+    Value s3 = k4Header->getArgument(4);
+    Value k4Cond = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt,
+                                                 k4i, nb);
+    rewriter.create<LLVM::CondBrOp>(loc, k4Cond, k4Body, ValueRange{}, k4Exit,
+                                    ValueRange{s0, s1, s2, s3});
+
+    // k4 body: load the shared activation super-block ONCE, do 4 weight rows.
+    rewriter.setInsertionPointToEnd(k4Body);
+    Value qBlkOff4 = rewriter.create<LLVM::MulOp>(loc, k4i, c1024);
+    Value scOff4a = rewriter.create<LLVM::MulOp>(loc, k4i, c64);
+    Value scOff4 = rewriter.create<LLVM::AddOp>(loc, K, scOff4a);
+    Value aBlk4 = gepI8(actRowBase, qBlkOff4);
+    Value a8[8];
+    loadAct8(aBlk4, a8);
+    Value aScaleRaw4 = loadVec(actRowBase, scOff4);
+    Value aScale4 = call1(vshuffhFn, v32i32, ValueRange{aScaleRaw4});
+    Value sIn[4] = {s0, s1, s2, s3};
+    Value sNext[4];
+    for (int j = 0; j < 4; j++) {
+      Value wBlk = gepI8(wtRowBase4[j], qBlkOff4);
+      Value intDot = rmpyRow(a8, wBlk);
+      Value wScaleRaw = loadVec(wtRowBase4[j], scOff4);
+      sNext[j] = scaleAccum(intDot, aScale4, wScaleRaw, sIn[j]);
+    }
+    Value k4iNext = rewriter.create<LLVM::AddOp>(loc, k4i, c1);
+    rewriter.create<LLVM::BrOp>(
+        loc, ValueRange{k4iNext, sNext[0], sNext[1], sNext[2], sNext[3]},
+        k4Header);
+
+    // k4 exit: reduce each of the 4 accumulators and store 4 f32 outputs.
+    rewriter.setInsertionPointToEnd(k4Exit);
+    for (int j = 0; j < 4; j++) {
+      Value nj = rewriter.create<LLVM::AddOp>(loc, n4, cst(j));
+      Value outIdx = rewriter.create<LLVM::AddOp>(loc, mOutElt, nj);
+      reduceStore(k4Exit->getArgument(j), outIdx);
+    }
+    Value n4Next = rewriter.create<LLVM::AddOp>(loc, n4, c4);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{n4Next}, n4Header);
+
+    // ---- N tail (1x1) loop: handles the last N%4 rows ----
     rewriter.setInsertionPointToEnd(nHeader);
     Value n = nHeader->getArgument(0);
     Value nCond = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt,
@@ -1004,43 +1121,20 @@ struct LowerMatmulVrmpyQ8
     Value aBlk = gepI8(actRowBase, qBlkOff);
     Value wBlk = gepI8(wtRowBase, qBlkOff);
     Value intDot = rmpyBlock(aBlk, wBlk);
-    Value intDotF = call1(convSfWFn, v32i32, ValueRange{intDot});
-    // scales: load 32 fp16 (64B), vshuffh, qf16 multiply, lo, conv to sf.
     Value aScaleRaw = loadVec(actRowBase, scaleBlkOff);
-    Value wScaleRaw = loadVec(wtRowBase, scaleBlkOff);
     Value aScale = call1(vshuffhFn, v32i32, ValueRange{aScaleRaw});
-    Value wScale = call1(vshuffhFn, v32i32, ValueRange{wScaleRaw});
-    Value ddPair = call1(mpyQf32HfFn, v64i32, ValueRange{wScale, aScale});
-    Value ddLo = call1(loFn, v32i32, ValueRange{ddPair});
-    Value ddSf = call1(convSfQf32Fn, v32i32, ValueRange{ddLo});
-    Value fa = call1(mpyQf32SfFn, v32i32, ValueRange{intDotF, ddSf});
-    Value accQf = call1(addQf32MixFn, v32i32, ValueRange{fa, r0sum});
-    Value r0Next = call1(convSfQf32Fn, v32i32, ValueRange{accQf});
+    Value wScaleRaw = loadVec(wtRowBase, scaleBlkOff);
+    Value r0Next = scaleAccum(intDot, aScale, wScaleRaw, r0sum);
     Value kiNext = rewriter.create<LLVM::AddOp>(loc, ki, c1);
     rewriter.create<LLVM::BrOp>(loc, ValueRange{kiNext, r0Next}, kHeader);
 
     // k exit: horizontal-reduce-sum then store lane 0.
     rewriter.setInsertionPointToEnd(kExit);
-    Value red = kExit->getArgument(0);
-    // hvx_vec_reduce_sum_f32: width = 4,8,16,32,64 -> 5 steps (total 128).
-    for (int w = 4; w < 128; w <<= 1) {
-      Value rot = call1(vrorFn, v32i32, ValueRange{red, cst(w)});
-      Value add = call1(addSfFn, v32i32, ValueRange{red, rot});
-      red = call1(convSfQf32Fn, v32i32, ValueRange{add});
-    }
-    // out elem index = mOutElt + n ; store lane0 as f32.
     Value outIdx = rewriter.create<LLVM::AddOp>(loc, mOutElt, n);
-    Value outElemPtr = rewriter.create<LLVM::GEPOp>(
-        loc, ptrTy, f32Ty, outPtr, ValueRange{outIdx});
-    Value redF = rewriter.create<LLVM::BitcastOp>(
-        loc, VectorType::get({32}, f32Ty), red);
-    Value lane0 =
-        rewriter.create<LLVM::ExtractElementOp>(loc, redF, cst(0));
-    rewriter.create<LLVM::StoreOp>(loc, lane0, outElemPtr, /*align=*/4);
+    reduceStore(kExit->getArgument(0), outIdx);
     Value nNext = rewriter.create<LLVM::AddOp>(loc, n, c1);
     rewriter.create<LLVM::BrOp>(loc, ValueRange{nNext}, nHeader);
 
-    (void)c4;
     rewriter.eraseOp(op);
     return success();
   }
