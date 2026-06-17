@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Transforms/Transforms.h"
@@ -263,13 +264,54 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
       auto mt = dyn_cast<MemRefType>(arg.getType());
       if (!mt)
         continue;
-      if (mt.getElementType().isInteger(8)) {
-        if (found) // ambiguous: more than one i8 memref arg
+      // The Q8 weight is the DDR (memory space 0) i8 memref arg. In the split
+      // (HEXKL_SPLIT_DEQUANT_M8) path the func ALSO carries an external VTCM i8
+      // arg (rank-1, memory space 1) -- skip it so the Q8 lookup stays
+      // unambiguous.
+      if (mt.getElementType().isInteger(8) &&
+          mt.getMemorySpaceAsInt() != hexagon::VTCM_ADDRESS_SPACE) {
+        if (found) // ambiguous: more than one DDR i8 memref arg
           return nullptr;
         found = arg;
       }
     }
     return found;
+  }
+
+  // Split (HEXKL_SPLIT_DEQUANT_M8) path: locate the trailing scalar `index`
+  // runtime arg carrying the wt-tile base byte offset into the shared VTCM
+  // arena. When present, the split halves use it as wtOff instead of the
+  // compile-derived act_off+act_bytes, so the shim can double-buffer the weight
+  // region. Returns nullptr if the func has no scalar index arg (legacy
+  // single-buffer kernels) so callers fall back to the computed offset.
+  static Value findWtOffArg(hexkl::MatmulOp op) {
+    auto func = op->getParentOfType<FunctionOpInterface>();
+    if (!func)
+      return nullptr;
+    for (Value arg : func.getArguments())
+      if (arg.getType().isIndex())
+        return arg;
+    return nullptr;
+  }
+
+  // Split (HEXKL_SPLIT_DEQUANT_M8) path: locate the external VTCM arena passed
+  // in as a func argument -- a rank-1 i8 memref in VTCM address space (memory
+  // space 1). Both split funcs (compiler_dequant / compiler_m8) take this as
+  // their first arg so they share the same arena base + offset formula.
+  static Value findExternalVtcmArg(hexkl::MatmulOp op) {
+    auto func = op->getParentOfType<FunctionOpInterface>();
+    if (!func)
+      return nullptr;
+    for (Value arg : func.getArguments()) {
+      auto mt = dyn_cast<MemRefType>(arg.getType());
+      if (!mt)
+        continue;
+      if (mt.hasRank() && mt.getRank() == 1 &&
+          mt.getElementType().isInteger(8) &&
+          mt.getMemorySpaceAsInt() == hexagon::VTCM_ADDRESS_SPACE)
+        return arg;
+    }
+    return nullptr;
   }
 
   // Inline-HMX decomposition: all-resident VTCM arena + one hexkl.hmx_core_dot.
@@ -288,6 +330,31 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                                  Value idx1, Value idx32, Value dimM, Value dimN,
                                  Value M, Value K, Value N, Value kTiles,
                                  Value kTilesI32) const {
+    if (::getenv("HEXKL_VRMPY")) {
+      // int8-vrmpy 1-touch path: no VTCM dequant arena, no HMX. Pull the two
+      // q8x4x2 i8 args (activation %Aq8 first, weight %Wq8 second) positionally
+      // -- findQ8WeightArg returns nullptr with >1 i8 DDR arg.
+      auto func = op->getParentOfType<FunctionOpInterface>();
+      Value actI8, wtI8;
+      for (Value arg : func.getArguments()) {
+        auto mt = dyn_cast<MemRefType>(arg.getType());
+        if (mt && mt.getElementType().isInteger(8) &&
+            mt.getMemorySpaceAsInt() != hexagon::VTCM_ADDRESS_SPACE) {
+          if (!actI8)
+            actI8 = arg;
+          else if (!wtI8)
+            wtI8 = arg;
+        }
+      }
+      if (!actI8 || !wtI8)
+        return failure();
+      rewriter.create<hexkl::MatmulVrmpyQ8Op>(loc, /*out=*/result,
+                                              /*act=*/actI8, /*wt=*/wtI8,
+                                              /*k=*/K);
+      rewriter.eraseOp(op);
+      return success();
+    }
+
     // Tile counts (index + i32).
     Value mTiles = rewriter.create<arith::DivUIOp>(loc, dimM, idx32);
     Value nTiles = rewriter.create<arith::DivUIOp>(loc, dimN, idx32);
@@ -331,6 +398,108 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                                             scratchOffI32);
     Value vtcmBytes =
         rewriter.create<arith::AddIOp>(loc, scratchOffIdx, idx2048);
+
+    // ----------------------------------------------------------------------
+    // SPLIT path (HEXKL_SPLIT_DEQUANT_M8, default OFF): emit ONLY half of the
+    // fused 6-op pipeline depending on which func encloses this matmul, sharing
+    // an EXTERNAL VTCM arena passed as a func arg (no internal Alloc/Dealloc).
+    // The arena offsets above are computed identically from M/K/N in BOTH
+    // funcs, so dequant's writes and M8's reads land on the same VTCM tiles.
+    //   func "compiler_dequant": act layout + weight dequant (HVX, no HMX) --
+    //       parallelizable across threads (weight dequant can be tile-ranged).
+    //   func "compiler_m8":      HMX setup + bias init + M8 + readout (single
+    //       thread; owns the HMX unit).
+    // Anything else: fall through to the original single-func fused path.
+    // ----------------------------------------------------------------------
+    if (::getenv("HEXKL_SPLIT_DEQUANT_M8")) {
+      Value extVtcm = findExternalVtcmArg(op);
+      if (!extVtcm)
+        return rewriter.notifyMatchFailure(
+            op, "HEXKL_SPLIT_DEQUANT_M8: no external VTCM i8 memref (rank-1, "
+                "space 1) argument found on the enclosing func");
+      auto func = op->getParentOfType<FunctionOpInterface>();
+      StringRef fname = func ? func.getName() : StringRef();
+      bool isDequant = fname.contains("dequant");
+      bool isM8 = fname.contains("m8") || fname.contains("M8");
+      if (!isDequant && !isM8)
+        return rewriter.notifyMatchFailure(
+            op, "HEXKL_SPLIT_DEQUANT_M8: enclosing func name must contain "
+                "'dequant' or 'm8' to select the split half");
+
+      // Runtime wt_off: when the func carries a trailing scalar index arg, the
+      // weight tiles live at a CALLER-CHOSEN base (the shim double-buffers the
+      // wt region), so the fixed regions must NOT include wt in their chain --
+      // otherwise out/bias/scratch would shift with the runtime wt_off. Re-lay
+      // the fixed regions as act|out|bias|flat|scratch (wt excluded) and take
+      // wtOff from the arg. Without the arg (legacy single-buffer kernels), keep
+      // the original act|wt|out|... layout computed above.
+      Value wtOffArg = findWtOffArg(op);
+      if (wtOffArg) {
+        wtOffI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, wtOffArg);
+        outOffI32 = rewriter.create<arith::AddIOp>(loc, actOffI32, actBytesI32);
+        biasOffI32 =
+            rewriter.create<arith::AddIOp>(loc, outOffI32, outBytesI32);
+        flatOffI32 = rewriter.create<arith::AddIOp>(loc, biasOffI32, i32_2048);
+        scratchOffI32 =
+            rewriter.create<arith::AddIOp>(loc, flatOffI32, i32_2048);
+      }
+
+      if (isDequant) {
+        // --- dequant half: act layout + weight dequant only ---
+        rewriter.create<hexkl::HvxLayoutActivationOp>(loc, extVtcm, actOffI32,
+                                                      lhs, M, K);
+        if (enableQ8Weight) {
+          Value q8Src = findQ8WeightArg(op);
+          if (!q8Src)
+            return rewriter.notifyMatchFailure(
+                op, "HEXKL_SPLIT_DEQUANT_M8 dequant: no DDR i8 weight memref "
+                    "argument found on the enclosing func");
+          rewriter.create<hexkl::HvxLayoutWeightQ8Op>(loc, extVtcm, wtOffI32,
+                                                      q8Src, K, N);
+        } else {
+          rewriter.create<hexkl::HvxLayoutWeightOp>(loc, extVtcm, wtOffI32, rhs,
+                                                    K, N);
+        }
+        rewriter.eraseOp(op);
+        return success();
+      }
+
+      // --- M8 half: HMX setup + bias init + M8 + readout only ---
+      rewriter.create<hexkl::MicroHMXSetupAccReadF16Op>(loc, extVtcm);
+      {
+        // Match the i32 bias-view memory space to the external VTCM arg's own
+        // space attr (func args parse "1" as a plain index attr, not "1 : i32"),
+        // else memref.view rejects the space mismatch.
+        Attribute vtcmSpace =
+            cast<MemRefType>(extVtcm.getType()).getMemorySpace();
+        auto i32MemTy = MemRefType::get({512}, i32Ty,
+                                        MemRefLayoutAttrInterface{}, vtcmSpace);
+        Value biasOffIdx = rewriter.create<arith::IndexCastOp>(
+            loc, rewriter.getIndexType(), biasOffI32);
+        Value biasView = rewriter.create<memref::ViewOp>(
+            loc, i32MemTy, extVtcm, biasOffIdx, ValueRange{});
+        Value cScale =
+            rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 0x00003c00);
+        Value cZero = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 0);
+        Value idx512 = rewriter.create<arith::ConstantIndexOp>(loc, 512);
+        rewriter.create<scf::ForOp>(
+            loc, idx0, idx512, idx1, ValueRange{},
+            [&](OpBuilder &b, Location loc, Value i, ValueRange) {
+              Value isScale = b.create<arith::CmpIOp>(
+                  loc, arith::CmpIPredicate::ult, i, idx32);
+              Value v = b.create<arith::SelectOp>(loc, isScale, cScale, cZero);
+              b.create<memref::StoreOp>(loc, v, biasView, ValueRange{i});
+              b.create<scf::YieldOp>(loc);
+            });
+      }
+      rewriter.create<hexkl::HmxCoreDotOp>(loc, extVtcm, outOffI32, actOffI32,
+                                           wtOffI32, biasOffI32, mTilesI32,
+                                           nTilesI32, kTilesI32);
+      rewriter.create<hexkl::HvxReadoutOp>(loc, extVtcm, outOffI32, scratchOffI32,
+                                           result, M, N);
+      rewriter.eraseOp(op);
+      return success();
+    }
 
     // Manual VTCM alloc; tag for bufferization and dealloc after the readout.
     auto vtcmType =
