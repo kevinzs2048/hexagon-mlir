@@ -318,16 +318,6 @@ def HexKL_HvxLayoutWeightQ8Op
     region 2047) into the weight-half tile using the `i*128` transpose offsets.
 
     K must be a multiple of 32; N must be a multiple of 64.
-
-    `tile_start` / `tile_count` (default 0 / 0) restrict the CROUTON-path
-    layout to the half-open output-tile range `[tile_start, tile_start +
-    tile_count)` over the `(N/32)*(K/32)` weight tiles (tile order `[nt][kt]`).
-    `tile_count == 0` means "all tiles from tile_start to the end" — with the
-    default `0/0` this is the full range, preserving backward compatibility.
-    Each crouton tile is independent (src `t*1152`, dst `t*2048`), so a thread
-    shim can call this op N times with disjoint `[tile_start, tile_count)`
-    ranges to parallelize the dequant. Only the CROUTON path honors these; the
-    default / WIDE paths ignore them.
   }];
 
   let arguments = (ins
@@ -335,9 +325,7 @@ def HexKL_HvxLayoutWeightQ8Op
     I32:$wt_off,
     AnyNon0RankedMemRef:$q8_src,
     I32:$k,
-    I32:$n,
-    DefaultValuedAttr<I32Attr, "0">:$tile_start,
-    DefaultValuedAttr<I32Attr, "0">:$tile_count
+    I32:$n
   );
 
   let results = (outs);
