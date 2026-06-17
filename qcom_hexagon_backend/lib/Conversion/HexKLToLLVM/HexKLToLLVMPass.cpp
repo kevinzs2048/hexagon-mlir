@@ -858,10 +858,21 @@ struct LowerMatmulVrmpyQ8
       return rewriter.create<LLVM::CallOp>(loc, TypeRange{retTy}, *fn, args)
           .getResult();
     };
-    // Load a 128B HVX vector from base+off, unaligned (align 1).
+    // Load a 128B HVX vector from base+off, unaligned (align 1). Used for the
+    // fp16 group-scale loads, whose offset (K + kb*64) is only 64-aligned.
     auto loadVec = [&](Value base, Value off) -> Value {
       return rewriter.create<LLVM::LoadOp>(loc, v32i32, gepI8(base, off),
                                            /*align=*/1)
+          .getResult();
+    };
+    // Load a 128B HVX vector from a 128-aligned base+off. The q8x4x2 quant rows
+    // (weight in VTCM/DDR, activation in 128-aligned scratch) are 128-aligned and
+    // super-blocks sit at i*128, so the loads are genuinely aligned -> emit `vmem`
+    // (single aligned load) instead of `vmemu` (2-load+splice). Used for the
+    // bandwidth-heavy quant loads (8 per super-block per weight row).
+    auto loadVec128 = [&](Value base, Value off) -> Value {
+      return rewriter.create<LLVM::LoadOp>(loc, v32i32, gepI8(base, off),
+                                           /*align=*/128)
           .getResult();
     };
 
@@ -923,13 +934,13 @@ struct LowerMatmulVrmpyQ8
     // Load 8 act HVX vectors from a super-block (shared across weight rows).
     auto loadAct8 = [&](Value aBlk, Value a[8]) {
       for (int i = 0; i < 8; i++)
-        a[i] = loadVec(aBlk, cst(i * 128));
+        a[i] = loadVec128(aBlk, cst(i * 128));
     };
     // 8x vrmpybv (one weight row against pre-loaded act) + butterfly -> int32.
     auto rmpyRow = [&](Value a[8], Value wBlk) -> Value {
       Value r[8];
       for (int i = 0; i < 8; i++) {
-        Value w = loadVec(wBlk, cst(i * 128));
+        Value w = loadVec128(wBlk, cst(i * 128));
         r[i] = call1(vrmpyFn, v32i32, ValueRange{w, a[i]});
       }
       return butterfly(r);
