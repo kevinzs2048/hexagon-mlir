@@ -318,6 +318,16 @@ def HexKL_HvxLayoutWeightQ8Op
     region 2047) into the weight-half tile using the `i*128` transpose offsets.
 
     K must be a multiple of 32; N must be a multiple of 64.
+
+    `tile_start` / `tile_count` (default 0 / 0) restrict the CROUTON-path
+    layout to the half-open output-tile range `[tile_start, tile_start +
+    tile_count)` over the `(N/32)*(K/32)` weight tiles (tile order `[nt][kt]`).
+    `tile_count == 0` means "all tiles from tile_start to the end" — with the
+    default `0/0` this is the full range, preserving backward compatibility.
+    Each crouton tile is independent (src `t*1152`, dst `t*2048`), so a thread
+    shim can call this op N times with disjoint `[tile_start, tile_count)`
+    ranges to parallelize the dequant. Only the CROUTON path honors these; the
+    default / WIDE paths ignore them.
   }];
 
   let arguments = (ins
@@ -325,13 +335,37 @@ def HexKL_HvxLayoutWeightQ8Op
     I32:$wt_off,
     AnyNon0RankedMemRef:$q8_src,
     I32:$k,
-    I32:$n
+    I32:$n,
+    DefaultValuedAttr<I32Attr, "0">:$tile_start,
+    DefaultValuedAttr<I32Attr, "0">:$tile_count
   );
 
   let results = (outs);
 
   let assemblyFormat =
     "`(` $hmx_block `,` $wt_off `,` $q8_src `,` $k `,` $n `)` `:` type($hmx_block) `,` type($wt_off) `,` type($q8_src) `,` type($k) `,` type($n) attr-dict";
+}
+
+def HexKL_MatmulVrmpyQ8Op
+  : HexKL_Op<"matmul_vrmpy_q8", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "HVX int8-vrmpy 1-touch matmul over q8x4x2 weight+activation";
+  let description = [{
+    Computes out[M][N] f32 = act[M][K] (q8x4x2 int8) * weightT[N][K] (q8x4x2 int8),
+    via Q6_Vw_vrmpy_VbVb (llvm.hexagon.V6.vrmpybv.128B) int8 x int8 -> int32, with the
+    combined fp16 weight-scale x activation-scale applied AFTER int32 accumulation
+    (no fp16 weight materialization). Both `act` and `wt` are q8x4x2-packed:
+    `[K int8 quants][ (K/32) fp16 scales]`, row_stride = K + (K/32)*2 (the caller
+    passes the padded/128-aligned stride via the memref). `k` is the runtime K (mult of 32).
+  }];
+  let arguments = (ins
+    AnyNon0RankedMemRef:$out,   // f32 [M][N]
+    AnyNon0RankedMemRef:$act,   // i8  [M][a_stride]
+    AnyNon0RankedMemRef:$wt,    // i8  [N][w_stride]
+    I32:$k
+  );
+  let results = (outs);
+  let assemblyFormat =
+    "`(` $out `,` $act `,` $wt `,` $k `)` `:` type($out) `,` type($act) `,` type($wt) `,` type($k) attr-dict";
 }
 
 def HexKL_HvxLayoutActivationOp
