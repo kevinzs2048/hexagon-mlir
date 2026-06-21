@@ -701,9 +701,20 @@ struct LowerHmxCoreDot
 
     // col latch: read out acc, c++, back to col header
     rewriter.setInsertionPointToEnd(cLatch);
-    // out_tile = out_base + (r*n_col_tiles + c) * 2048
-    Value rTimesNcol = rewriter.create<LLVM::MulOp>(loc, r, nColTiles);
+    // out_tile = out_base + outTileIdx * 2048.
+    // Default (out_col_stride==0): outTileIdx = r*n_col_tiles + c  (the VTCM
+    // output region is [mt][nt] row-major with row stride = n_col_tiles).
+    // N-chunked (out_col_stride!=0): outTileIdx = r*out_col_stride + out_col_off
+    // + c  -- the chunk writes into a FULL-N output region (row stride =
+    // out_col_stride = full N/32) at its column offset out_col_off, so the
+    // single full-N readout consumes the concatenation directly.
+    Value outColStride = adaptor.getOutColStride(); // null if absent
+    Value outColOff = adaptor.getOutColOff();        // null if absent
+    Value rowStrideV = outColStride ? outColStride : nColTiles;
+    Value rTimesNcol = rewriter.create<LLVM::MulOp>(loc, r, rowStrideV);
     Value outTileIdx = rewriter.create<LLVM::AddOp>(loc, rTimesNcol, c);
+    if (outColOff)
+      outTileIdx = rewriter.create<LLVM::AddOp>(loc, outTileIdx, outColOff);
     Value outTileByte =
         rewriter.create<LLVM::MulOp>(loc, outTileIdx, tileBytes);
     Value outTilePtr = gepI8(outBase, outTileByte);
@@ -1582,15 +1593,30 @@ struct LowerHvxLayoutWeightQ8
       // (tileEnd = nOutT), so the default 0/0 is the full range (backward
       // compatible). Each crouton tile is independent (src t*1152, dst t*2048),
       // so a thread shim emits one op per disjoint range to parallelize dequant.
+      // Runtime range operands (N-chunked decompose) override the attrs.
+      Value tStartDyn = adaptor.getTileStartDyn(); // null if absent
+      Value tCountDyn = adaptor.getTileCountDyn();
       int64_t tileStartAttr = op.getTileStart();
       int64_t tileCountAttr = op.getTileCount();
-      Value tStart = cst(tileStartAttr);
+      Value tStart;
       Value tileEnd;
-      if (tileCountAttr == 0) {
-        // Whole remaining range: nOutT (tileStartAttr defaults to 0 -> full).
-        tileEnd = nOutT;
+      bool dynRange = (tStartDyn != nullptr);
+      if (dynRange) {
+        tStart = tStartDyn;
+        // tile_count_dyn == 0 means "to the end" (nOutT), mirroring the attr.
+        Value zero = cst(0);
+        Value isZero = rewriter.create<LLVM::ICmpOp>(
+            loc, LLVM::ICmpPredicate::eq, tCountDyn, zero);
+        Value endIfCount = rewriter.create<LLVM::AddOp>(loc, tStartDyn, tCountDyn);
+        tileEnd = rewriter.create<LLVM::SelectOp>(loc, isZero, nOutT, endIfCount);
       } else {
-        tileEnd = cst(tileStartAttr + tileCountAttr);
+        tStart = cst(tileStartAttr);
+        if (tileCountAttr == 0) {
+          // Whole remaining range: nOutT (tileStartAttr defaults to 0 -> full).
+          tileEnd = nOutT;
+        } else {
+          tileEnd = cst(tileStartAttr + tileCountAttr);
+        }
       }
       Block *orig = rewriter.getInsertionBlock();
       Block *cont = rewriter.splitBlock(orig, rewriter.getInsertionPoint());
@@ -1608,11 +1634,20 @@ struct LowerHvxLayoutWeightQ8
       rewriter.create<LLVM::CondBrOp>(loc, tCond, tBody, ValueRange{}, cont, ValueRange{});
 
       rewriter.setInsertionPointToEnd(tBody);
+      // SRC offset uses the GLOBAL linear tile index t (selects the correct
+      // weight columns). DST offset is CHUNK-LOCAL: (t - tile_start)*2048, so an
+      // N-chunk's weight tiles land at the BASE of the wt region (which the
+      // decompose sizes to one chunk, not full N) and hmx_core_dot reads them at
+      // wt_base + c*dot_stride, c in [0, chunk_n_tiles). With the default
+      // tile_start==0 this is byte-identical to t*2048 (full-range path).
       Value tSrcOff = rewriter.create<LLVM::MulOp>(loc, t, c1152);
       Value svPtr = gepI8(q8Base, tSrcOff);
       Value vSv = rewriter.create<LLVM::LoadOp>(loc, v32i32, svPtr, /*align=*/1).getResult();
       Value qzBase = gepI8(q8Base, rewriter.create<LLVM::AddOp>(loc, tSrcOff, c128));
-      Value tileDst = gepI8(wtBase, rewriter.create<LLVM::MulOp>(loc, t, c2048));
+      Value tLocal = (dynRange || tileStartAttr != 0)
+                         ? rewriter.create<LLVM::SubOp>(loc, t, tStart)
+                         : t;
+      Value tileDst = gepI8(wtBase, rewriter.create<LLVM::MulOp>(loc, tLocal, c2048));
       rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, iHdr);
 
       rewriter.setInsertionPointToEnd(tLatch);

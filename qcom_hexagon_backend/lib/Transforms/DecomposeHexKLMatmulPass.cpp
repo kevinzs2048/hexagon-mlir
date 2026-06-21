@@ -328,12 +328,55 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value i32_2048 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 2048);
     Value idx2048 = rewriter.create<arith::ConstantIndexOp>(loc, 2048);
 
-    // Region byte sizes (index).
+    // Region tile counts (index).
     Value mkTiles = rewriter.create<arith::MulIOp>(loc, mTiles, kTiles);
-    Value nkTiles = rewriter.create<arith::MulIOp>(loc, nTiles, kTiles);
     Value mnTiles = rewriter.create<arith::MulIOp>(loc, mTiles, nTiles);
+
+    // ----------------------------------------------------------------------
+    // N-chunking (Q8/CROUTON path): the weight (N*K) is the VTCM-overflow
+    // source for large prefill shapes (e.g. N6144*K8192 weight = 96 MiB >> 8
+    // MiB VTCM). We chunk the OUTPUT-COLUMN (N) dimension: each N_chunk is an
+    // INDEPENDENT, complete matmul over the FULL K (clear -> stream full K ->
+    // readout), exactly like the all-resident path, just over fewer output
+    // columns. NO cross-call accumulation. The activation (M*K, full-K) is laid
+    // out ONCE outside the N-loop and reused; only the weight region is sized
+    // per-chunk. The output region stays full-N (cheap: m_tiles*n_tiles tiles)
+    // so the single full-N readout consumes the concatenation untouched.
+    //
+    //   arena(chunk) = (mkTiles + chunk_nt*kTiles + mnTiles)*2048 + 3*2048
+    //                                 ^^wt^^                       ^bias/flat/scratch
+    // Solve chunk_nt under a 7 MiB budget (1 MiB VTCM slack):
+    //   avail_wt_tiles = BUDGET/2048 - mkTiles - mnTiles - 3
+    //   chunk_nt       = clamp(avail_wt_tiles / kTiles, 1, nTiles)
+    // chunk_nt==nTiles (single chunk) reproduces the all-resident path exactly.
+    constexpr int64_t kVtcmBudgetTiles = (7 * 1024 * 1024) / 2048; // 3584
+    Value budgetTilesC =
+        rewriter.create<arith::ConstantIndexOp>(loc, kVtcmBudgetTiles);
+    Value idx3 = rewriter.create<arith::ConstantIndexOp>(loc, 3);
+    Value fixedTiles = rewriter.create<arith::AddIOp>(loc, mkTiles, mnTiles);
+    fixedTiles = rewriter.create<arith::AddIOp>(loc, fixedTiles, idx3);
+    // availWt = budget - fixed; guard non-negative (clamp to >=kTiles so the
+    // div yields >=1). If even one column doesn't fit, chunk_nt clamps to 1 and
+    // the alloc may still exceed VTCM -> the DSP would fault; for Qwen3
+    // (K<=8192) one column + full-K act always fits, so this is a guard only.
+    Value availWt = rewriter.create<arith::SubIOp>(loc, budgetTilesC, fixedTiles);
+    // max(availWt, kTiles) so chunk_nt >= 1 even under pressure.
+    Value availClamped = rewriter.create<arith::MaxSIOp>(loc, availWt, kTiles);
+    Value chunkNtRaw =
+        rewriter.create<arith::DivUIOp>(loc, availClamped, kTiles);
+    // min(chunkNtRaw, nTiles): never chunk wider than the matrix.
+    Value chunkNt = rewriter.create<arith::MinUIOp>(loc, chunkNtRaw, nTiles);
+    // The fp16 (non-Q8) weight layout op does not support a tile range, so it
+    // can only run all-resident: force a single chunk (chunk_nt = nTiles). The
+    // N-chunking is exercised only on the Q8/CROUTON prefill path.
+    if (!enableQ8Weight)
+      chunkNt = nTiles;
+    Value chunkNtI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, chunkNt);
+
+    // wt region is sized for ONE chunk (chunk_nt * kTiles tiles).
+    Value chunkNkTiles = rewriter.create<arith::MulIOp>(loc, chunkNt, kTiles);
     Value actBytes = rewriter.create<arith::MulIOp>(loc, mkTiles, idx2048);
-    Value wtBytes = rewriter.create<arith::MulIOp>(loc, nkTiles, idx2048);
+    Value wtBytes = rewriter.create<arith::MulIOp>(loc, chunkNkTiles, idx2048);
     Value outBytes = rewriter.create<arith::MulIOp>(loc, mnTiles, idx2048);
 
     // Arena offsets (i32 bytes). act|wt|out|bias|flat|scratch, all 2048-aligned.
@@ -384,34 +427,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     rewriter.create<hexkl::HvxLayoutActivationOp>(loc, vtcm, actOffI32, lhs, M,
                                                   K);
 
-    // --- 3. lay out ALL weight tiles: wt[nt][kt] (N outer, K inner) ---
-    // ONE compiler-emitted HVX vscattermhw layout over the whole [K][N] DDR
-    // weight, replacing the per-(kt,nt) rm_to_wh loop. The op reads rhs [K][N]
-    // row-major directly (NO transpose) and writes tile (nt,kt) at
-    // wtOff + (nt*n_k_tiles+kt)*2048 -- the order hmx_core_dot's col loop
-    // expects (spike T8 weight-tile-order fix). Byte-identical output.
-    //
-    // Q8-weight path (flag-gated, default off): instead of laying out a
-    // pre-dequantized fp16 [K][N] weight, fuse the int8->fp16 dequant into the
-    // layout by emitting hvx_layout_weight_q8 over the q8x4x2 weight in its
-    // natural [N][row_stride] orientation -- eliminating the slow scalar
-    // [N][K]->[K][N] dequant+transpose. The Q8 i8 weight is supplied as an extra
-    // i8 memref argument on the kernel func (the fp16 rhs still carries K/N for
-    // hmx_core_dot's tile counts). act layout / hmx_core_dot / readout are
-    // unchanged, so the default fp16 path is byte-identical when the flag is off.
-    if (enableQ8Weight) {
-      Value q8Src = findQ8WeightArg(op);
-      if (!q8Src)
-        return rewriter.notifyMatchFailure(
-            op, "enableQ8Weight: no i8 weight memref argument found on the "
-                "enclosing func");
-      rewriter.create<hexkl::HvxLayoutWeightQ8Op>(loc, vtcm, wtOffI32, q8Src, K,
-                                                  N);
-    } else {
-      rewriter.create<hexkl::HvxLayoutWeightOp>(loc, vtcm, wtOffI32, rhs, K, N);
-    }
-
-    // --- 4. init bias struct in the bias tile ---
+    // --- 4. init bias struct in the bias tile (ONCE, reused per N_chunk) ---
     // HMX scale/bias structure for Q6_bias_mxmem2_A: first 32 i32 lanes =
     // 0x00003c00 (per-column scale 1.0, bias 0), rest of the 2048-byte tile 0.
     // View the i8 VTCM at byte offset biasOff as 512 x i32 and fill.
@@ -438,10 +454,75 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
           });
     }
 
-    // --- 5. ONE hexkl.hmx_core_dot ---
-    rewriter.create<hexkl::HmxCoreDotOp>(
-        loc, vtcm, outOffI32, actOffI32, wtOffI32, biasOffI32, mTilesI32,
-        nTilesI32, kTilesI32);
+    // --- 3+5. N-loop: per-chunk weight layout + hmx_core_dot ---
+    // Each iteration handles a contiguous block of chunk_nt output-column tiles
+    // [ntStart, ntStart+thisNt). thisNt = min(chunk_nt, nTiles-ntStart) handles
+    // the tail. Per chunk:
+    //   (a) lay out THIS chunk's weight tiles (linear tile range
+    //       [ntStart*kTiles, (ntStart+thisNt)*kTiles)) into the chunk-sized wt
+    //       region at its BASE (the q8 lowering writes dst chunk-local).
+    //   (b) ONE hmx_core_dot over full K, thisNt columns, writing into the
+    //       FULL-N output region at column offset ntStart with full-N row stride
+    //       (out_col_stride = nTiles, out_col_off = ntStart*mTiles?  -- NO: the
+    //       output tile index is r*nTiles + ntStart + c, so out_col_off =
+    //       ntStart, out_col_stride = nTiles).
+    // Single full-N readout AFTER the loop consumes the [mt][nt] row-major
+    // output region untouched.
+    //
+    // The default fp16 weight path (non-Q8) cannot do tile ranges, so chunkNt
+    // was forced to nTiles above -> exactly one iteration, all-resident, and we
+    // emit the plain (non-range, non-col-offset) ops = byte-identical legacy.
+    Value q8Src;
+    if (enableQ8Weight) {
+      q8Src = findQ8WeightArg(op);
+      if (!q8Src)
+        return rewriter.notifyMatchFailure(
+            op, "enableQ8Weight: no i8 weight memref argument found on the "
+                "enclosing func");
+    }
+    {
+      // tile_start_dyn / out_col_off are linear-tile / column-tile indices.
+      rewriter.create<scf::ForOp>(
+          loc, idx0, nTiles, chunkNt, ValueRange{},
+          [&](OpBuilder &b, Location loc, Value ntStart, ValueRange) {
+            // thisNt = min(chunkNt, nTiles - ntStart)
+            Value rem = b.create<arith::SubIOp>(loc, nTiles, ntStart);
+            Value thisNt = b.create<arith::MinUIOp>(loc, chunkNt, rem);
+            Value thisNtI32 =
+                b.create<arith::IndexCastOp>(loc, i32Ty, thisNt);
+            Value ntStartI32 =
+                b.create<arith::IndexCastOp>(loc, i32Ty, ntStart);
+
+            if (enableQ8Weight) {
+              // Weight tile range [tileStart, tileStart+tileCount) (linear,
+              // [nt][kt] order, nt outer): tileStart = ntStart*kTiles,
+              // tileCount = thisNt*kTiles.
+              Value tsIdx = b.create<arith::MulIOp>(loc, ntStart, kTiles);
+              Value tcIdx = b.create<arith::MulIOp>(loc, thisNt, kTiles);
+              Value tsI32 = b.create<arith::IndexCastOp>(loc, i32Ty, tsIdx);
+              Value tcI32 = b.create<arith::IndexCastOp>(loc, i32Ty, tcIdx);
+              b.create<hexkl::HvxLayoutWeightQ8Op>(
+                  loc, vtcm, wtOffI32, q8Src, K, N,
+                  /*tile_start=*/b.getI32IntegerAttr(0),
+                  /*tile_count=*/b.getI32IntegerAttr(0),
+                  /*tile_start_dyn=*/tsI32, /*tile_count_dyn=*/tcI32);
+              // hmx_core_dot: thisNt columns over full K, output into full-N
+              // region at column offset ntStart (row stride = full nTiles).
+              b.create<hexkl::HmxCoreDotOp>(
+                  loc, vtcm, outOffI32, actOffI32, wtOffI32, biasOffI32,
+                  mTilesI32, thisNtI32, kTilesI32,
+                  /*out_col_stride=*/nTilesI32, /*out_col_off=*/ntStartI32);
+            } else {
+              // Single all-resident chunk (chunkNt==nTiles): legacy ops.
+              b.create<hexkl::HvxLayoutWeightOp>(loc, vtcm, wtOffI32, rhs, K, N);
+              b.create<hexkl::HmxCoreDotOp>(
+                  loc, vtcm, outOffI32, actOffI32, wtOffI32, biasOffI32,
+                  mTilesI32, nTilesI32, kTilesI32,
+                  /*out_col_stride=*/Value(), /*out_col_off=*/Value());
+            }
+            b.create<scf::YieldOp>(loc);
+          });
+    }
 
     // --- 6. readout all (mt,nt) output tiles -> DDR fp32 ---
     // ONE compiler-emitted HVX vgathermhw + fpext readout over the whole acc

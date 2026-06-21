@@ -296,7 +296,7 @@ def HexKL_HvxLayoutWeightOp
 
 def HexKL_HvxLayoutWeightQ8Op
   : HexKL_Op<"hvx_layout_weight_q8",
-      [MemoryEffects<[MemRead, MemWrite]>]> {
+      [MemoryEffects<[MemRead, MemWrite]>, AttrSizedOperandSegments]> {
   let hasVerifier = 1;
 
   let summary = "Fast HVX Q8_0 weight-half tile layout via fused dequant+vscatter";
@@ -328,6 +328,14 @@ def HexKL_HvxLayoutWeightQ8Op
     shim can call this op N times with disjoint `[tile_start, tile_count)`
     ranges to parallelize the dequant. Only the CROUTON path honors these; the
     default / WIDE paths ignore them.
+
+    `tile_start_dyn` / `tile_count_dyn` (optional, runtime I32 operands) are the
+    dynamic-shape counterpart of the `tile_start`/`tile_count` attrs, used by the
+    N-chunked decompose where the chunk range is only known at runtime. When
+    present they OVERRIDE the attrs. The src tile offset stays GLOBAL (`t*1152`,
+    selecting the right weight columns) but the dst is written CHUNK-LOCAL
+    (`(t - tile_start)*2048`) so the chunk's weight lands at the base of a
+    chunk-sized wt region.
   }];
 
   let arguments = (ins
@@ -337,13 +345,15 @@ def HexKL_HvxLayoutWeightQ8Op
     I32:$k,
     I32:$n,
     DefaultValuedAttr<I32Attr, "0">:$tile_start,
-    DefaultValuedAttr<I32Attr, "0">:$tile_count
+    DefaultValuedAttr<I32Attr, "0">:$tile_count,
+    Optional<I32>:$tile_start_dyn,
+    Optional<I32>:$tile_count_dyn
   );
 
   let results = (outs);
 
   let assemblyFormat =
-    "`(` $hmx_block `,` $wt_off `,` $q8_src `,` $k `,` $n `)` `:` type($hmx_block) `,` type($wt_off) `,` type($q8_src) `,` type($k) `,` type($n) attr-dict";
+    "`(` $hmx_block `,` $wt_off `,` $q8_src `,` $k `,` $n (`,` `range` $tile_start_dyn^ `,` $tile_count_dyn)? `)` `:` type($hmx_block) `,` type($wt_off) `,` type($q8_src) `,` type($k) `,` type($n) attr-dict";
 }
 
 def HexKL_MatmulVrmpyQ8Op
@@ -438,13 +448,30 @@ def HexKL_HvxReadoutOp
 
 def HexKL_HmxCoreDotOp
   : HexKL_Op<"hmx_core_dot",
-      [MemoryEffects<[MemRead, MemWrite]>]> {
+      [MemoryEffects<[MemRead, MemWrite]>, AttrSizedOperandSegments]> {
   let hasVerifier = 1;
 
   let summary = "Deep-streaming HMX fp16 matmul over VTCM-resident tiles";
   let description = [{
     Deep-streaming HMX fp16 matmul over VTCM-resident activation-half/weight-half
     tiles; lowers to inline HMX intrinsics.
+
+    The `c` (column) loop runs `[0, n_col_tiles)` and the weight half is read
+    chunk-local (`wt_base + c*dot_stride`). By default each readout tile lands at
+    `out_base + (r*n_col_tiles + c)*2048` — i.e. the VTCM output region is laid
+    out `[mt][nt]` row-major with row stride = `n_col_tiles`.
+
+    `out_col_stride` / `out_col_off` (optional, runtime I32 operands) support
+    N-chunked matmul, where a chunk computes only `n_col_tiles` output columns
+    but writes into a FULL-N output region so the single readout can consume it.
+    The two operands are checked independently: `out_col_stride`, when present,
+    replaces the row stride (`n_col_tiles` → `out_col_stride`); `out_col_off`,
+    when present, adds the chunk's column offset. So the readout tile lands at
+    `out_base + (r*<row_stride> + <col_off> + c)*2048`, where `<row_stride>`
+    defaults to `n_col_tiles` and `<col_off>` defaults to 0. The only producer
+    (DecomposeHexKLMatmulPass) always passes both together for an N-chunk and
+    neither for a single-chunk matmul; the latter is byte-identical to the
+    legacy `(r*n_col_tiles + c)` mapping.
   }];
 
   let arguments = (ins
@@ -455,13 +482,15 @@ def HexKL_HmxCoreDotOp
     I32:$bias_off,
     I32:$n_row_tiles,
     I32:$n_col_tiles,
-    I32:$n_dot_tiles
+    I32:$n_dot_tiles,
+    Optional<I32>:$out_col_stride,
+    Optional<I32>:$out_col_off
   );
 
   let results = (outs);
 
   let assemblyFormat =
-    "`(` $hmx_block `,` $out_off `,` $act_off `,` $wt_off `,` $bias_off `,` $n_row_tiles `,` $n_col_tiles `,` $n_dot_tiles `)` `:` type($hmx_block) `,` type($out_off) `,` type($act_off) `,` type($wt_off) `,` type($bias_off) `,` type($n_row_tiles) `,` type($n_col_tiles) `,` type($n_dot_tiles) attr-dict";
+    "`(` $hmx_block `,` $out_off `,` $act_off `,` $wt_off `,` $bias_off `,` $n_row_tiles `,` $n_col_tiles `,` $n_dot_tiles (`,` `cols` $out_col_stride^ `,` $out_col_off)? `)` `:` type($hmx_block) `,` type($out_off) `,` type($act_off) `,` type($wt_off) `,` type($bias_off) `,` type($n_row_tiles) `,` type($n_col_tiles) `,` type($n_dot_tiles) attr-dict";
 }
 
 #endif // HEXAGON_DIALECT_HEXKL_IR_HEXKL_OPS_TD
