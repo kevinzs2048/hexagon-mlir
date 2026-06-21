@@ -1527,6 +1527,7 @@ struct LowerHvxLayoutWeightQ8
     Value c16 = cst(16);
     Value c32 = cst(32);
     Value c64 = cst(64);
+    Value c128 = cst(128);
     Value c256 = cst(256);
     Value c2048 = cst(kHmxTileBytes);
     Value region = cst(kHmxTileBytes - 1); // 2047
@@ -1563,6 +1564,80 @@ struct LowerHvxLayoutWeightQ8
     Value rowStride = rewriter.create<LLVM::AddOp>(loc, K, scalesBytes);
     // wtBase = vtcm + wt_off.
     Value wtBase = gepI8(vtcmBase, wtOff);
+
+    // ===== CROUTON path (HEXKL_WQ8_CROUTON) — OmniOp-style ==========
+    // The weight (q8Base) is OFFLINE-permuted into per-WH-tile layout:
+    //   [128B scale-vec sv = (s0,s0,s1,s1,...,s31,s31)][16 colpair x 64 int8],
+    // 1152 B/tile, tile order [nt][kt] (matches the WH tile order). Per-call =
+    // trivial SEQUENTIAL load + dequant + CONTIGUOUS store (no strided read, no
+    // vscatter, no transpose; the transpose is baked into the offline permute).
+    // Host-verified byte-identical to the scatter layout (phaseB_permute.c).
+    // This is the prefill crouton lowering — env-gated, default OFF; the default
+    // fp16 dequant+vscatter path below is unchanged.
+    if (::getenv("HEXKL_WQ8_CROUTON")) {
+      Value c1152 = cst(1152);
+      Value nOutT = rewriter.create<LLVM::MulOp>(loc, nNTiles, nKTiles);
+      // Optional tile-range [tile_start, tile_start + tile_count) over the
+      // (N/32)*(K/32) output tiles. tile_count == 0 means "to the end"
+      // (tileEnd = nOutT), so the default 0/0 is the full range (backward
+      // compatible). Each crouton tile is independent (src t*1152, dst t*2048),
+      // so a thread shim emits one op per disjoint range to parallelize dequant.
+      int64_t tileStartAttr = op.getTileStart();
+      int64_t tileCountAttr = op.getTileCount();
+      Value tStart = cst(tileStartAttr);
+      Value tileEnd;
+      if (tileCountAttr == 0) {
+        // Whole remaining range: nOutT (tileStartAttr defaults to 0 -> full).
+        tileEnd = nOutT;
+      } else {
+        tileEnd = cst(tileStartAttr + tileCountAttr);
+      }
+      Block *orig = rewriter.getInsertionBlock();
+      Block *cont = rewriter.splitBlock(orig, rewriter.getInsertionPoint());
+      Block *tHdr = rewriter.createBlock(cont, {i32Ty}, {loc});
+      Block *tBody = rewriter.createBlock(cont);
+      Block *iHdr = rewriter.createBlock(cont, {i32Ty}, {loc});
+      Block *iBody = rewriter.createBlock(cont);
+      Block *tLatch = rewriter.createBlock(cont);
+
+      rewriter.setInsertionPointToEnd(orig);
+      rewriter.create<LLVM::BrOp>(loc, ValueRange{tStart}, tHdr);
+      rewriter.setInsertionPointToEnd(tHdr);
+      Value t = tHdr->getArgument(0);
+      Value tCond = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, t, tileEnd);
+      rewriter.create<LLVM::CondBrOp>(loc, tCond, tBody, ValueRange{}, cont, ValueRange{});
+
+      rewriter.setInsertionPointToEnd(tBody);
+      Value tSrcOff = rewriter.create<LLVM::MulOp>(loc, t, c1152);
+      Value svPtr = gepI8(q8Base, tSrcOff);
+      Value vSv = rewriter.create<LLVM::LoadOp>(loc, v32i32, svPtr, /*align=*/1).getResult();
+      Value qzBase = gepI8(q8Base, rewriter.create<LLVM::AddOp>(loc, tSrcOff, c128));
+      Value tileDst = gepI8(wtBase, rewriter.create<LLVM::MulOp>(loc, t, c2048));
+      rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, iHdr);
+
+      rewriter.setInsertionPointToEnd(tLatch);
+      rewriter.create<LLVM::BrOp>(loc, ValueRange{rewriter.create<LLVM::AddOp>(loc, t, c1)}, tHdr);
+
+      rewriter.setInsertionPointToEnd(iHdr);
+      Value i = iHdr->getArgument(0);
+      Value iCond = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, i, c16);
+      rewriter.create<LLVM::CondBrOp>(loc, iCond, iBody, ValueRange{}, tLatch, ValueRange{});
+
+      rewriter.setInsertionPointToEnd(iBody);
+      Value qPtr = gepI8(qzBase, rewriter.create<LLVM::MulOp>(loc, i, c64));
+      Value vq = rewriter.create<LLVM::LoadOp>(loc, v32i32, qPtr, /*align=*/1).getResult();
+      Value vpair = call1(unpackFn, v64i32, ValueRange{vq});
+      Value v16 = call1(loFn, v32i32, ValueRange{vpair});
+      Value vHf = call1(convHfHFn, v32i32, ValueRange{v16});
+      Value prod = call1(mpyFn, v32i32, ValueRange{vHf, vSv});
+      Value vdeq = call1(convHfQf16Fn, v32i32, ValueRange{prod});
+      Value dstPtr = gepI8(tileDst, rewriter.create<LLVM::MulOp>(loc, i, c128));
+      rewriter.create<LLVM::StoreOp>(loc, vdeq, dstPtr, /*align=*/128);
+      rewriter.create<LLVM::BrOp>(loc, ValueRange{rewriter.create<LLVM::AddOp>(loc, i, c1)}, iHdr);
+
+      rewriter.eraseOp(op);
+      return success();
+    }
 
     // ---- Outer loop over output tiles t in [0, nOutTiles) ----
     Block *origBlock = rewriter.getInsertionBlock();
