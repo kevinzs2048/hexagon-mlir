@@ -292,10 +292,14 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                                  Value idx1, Value idx32, Value dimM, Value dimN,
                                  Value M, Value K, Value N, Value kTiles,
                                  Value kTilesI32) const {
-    if (::getenv("HEXKL_VRMPY")) {
-      // int8-vrmpy 1-touch path: no VTCM dequant arena, no HMX. Pull the two
-      // q8x4x2 i8 args (activation %Aq8 first, weight %Wq8 second) positionally
-      // -- findQ8WeightArg returns nullptr with >1 i8 DDR arg.
+    // int8-vrmpy 1-touch decode paths: no VTCM dequant arena, no HMX. Pull the
+    // two i8 args (activation %Aq8 first, weight %Wq8 second) positionally --
+    // findQ8WeightArg returns nullptr with >1 i8 DDR arg. The CROUTON variant is
+    // checked FIRST and gated by its OWN env var so it can never perturb the
+    // q8x4x2 HEXKL_VRMPY path (landmine-history discipline). The two differ only
+    // in the weight layout the emitted kernel reads.
+    const bool vrmpyCrouton = ::getenv("HEXKL_VRMPY_CROUTON") != nullptr;
+    if (vrmpyCrouton || ::getenv("HEXKL_VRMPY")) {
       auto func = op->getParentOfType<FunctionOpInterface>();
       Value actI8, wtI8;
       for (Value arg : func.getArguments()) {
@@ -310,9 +314,14 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
       }
       if (!actI8 || !wtI8)
         return failure();
-      rewriter.create<hexkl::MatmulVrmpyQ8Op>(loc, /*out=*/result,
-                                              /*act=*/actI8, /*wt=*/wtI8,
-                                              /*k=*/K);
+      if (vrmpyCrouton)
+        rewriter.create<hexkl::MatmulVrmpyCroutonOp>(loc, /*out=*/result,
+                                                     /*act=*/actI8, /*wt=*/wtI8,
+                                                     /*k=*/K);
+      else
+        rewriter.create<hexkl::MatmulVrmpyQ8Op>(loc, /*out=*/result,
+                                                /*act=*/actI8, /*wt=*/wtI8,
+                                                /*k=*/K);
       rewriter.eraseOp(op);
       return success();
     }

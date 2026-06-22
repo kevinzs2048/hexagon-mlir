@@ -1163,6 +1163,278 @@ struct LowerMatmulVrmpyQ8
 };
 
 //===----------------------------------------------------------------------===//
+// Lower hexkl::MatmulVrmpyCroutonOp -> inline HVX int8-vrmpy over CROUTON weight
+//===----------------------------------------------------------------------===//
+//
+// Decode-path sibling of LowerMatmulVrmpyQ8. The ACTIVATION is the same q8x4x2
+// layout (K-contiguous int8 + (K/32) fp16 scales appended at +K). The WEIGHT is
+// the OmniOp CROUTON 1152B-tile layout (host repack_q8_0_crouton): per (nt,kt)
+// tile, [128B dup-scale sv][16 colpair x 64 int8 qz], tile order [nt][kt].
+//
+// For output row n (nt=n/32, r=n%32) the 32 K int8 of block kt are SCATTERED at
+// qz[i*64 + r*2 + p] (i=0..15, p=0,1) -- stride 64 -- so a raw super-block read
+// is garbage (spike PATH A = 57.7). We GATHER them K-contiguous via 16 halfword
+// (i16) loads at stride 64 into a <16xi16> register (= 32 K-contiguous int8),
+// then one Q6_Vw_vrmpy_VbVb against the matching 32 act int8 -> 8 partial int32
+// lanes (32 bytes / 4 per lane), summed. The row's fp16 weight scale is sv[r*2]
+// (= byte r*4 in the tile); the dup-scale drops in directly (no reshuffle).
+// Scale (wt_scale*act_scale) applied AFTER the int32 accumulate. This mirrors
+// spike PATH B (max_abs 1.7e-5). One block = K=32; no super-block tiling.
+//
+// Naive 1x1 over (m,n,kt). Correctness-first decode kernel (small M, N large).
+struct LowerMatmulVrmpyCrouton
+    : public ConvertOpToLLVMPattern<hexkl::MatmulVrmpyCroutonOp> {
+  using ConvertOpToLLVMPattern<
+      hexkl::MatmulVrmpyCroutonOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(hexkl::MatmulVrmpyCroutonOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    MLIRContext *ctx = rewriter.getContext();
+
+    auto i8Ty = rewriter.getI8Type();
+    auto i16Ty = rewriter.getI16Type();
+    auto i32Ty = rewriter.getI32Type();
+    auto f16Ty = rewriter.getF16Type();
+    auto f32Ty = rewriter.getF32Type();
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+    auto v32i32 = VectorType::get({32}, i32Ty);
+    auto v16i16 = VectorType::get({16}, i16Ty);
+
+    // Tag the enclosing llvm.func with HVX features (merge, preserve siblings).
+    if (auto enclosing = op->getParentOfType<LLVM::LLVMFuncOp>()) {
+      llvm::SmallVector<StringRef> feats;
+      if (auto existing = enclosing.getTargetFeaturesAttr())
+        for (StringRef f : existing.getFeatures())
+          feats.push_back(f);
+      for (StringRef want : {StringRef("+hvxv73"), StringRef("+hvx-length128b")})
+        if (!llvm::is_contained(feats, want))
+          feats.push_back(want);
+      enclosing.setTargetFeaturesAttr(
+          LLVM::TargetFeaturesAttr::get(ctx, feats));
+    }
+
+    // --- HVX intrinsic. vrmpybv: <32xi32> x <32xi32> -> <32xi32> (per-lane
+    // 4-int8 dot). The 8 low lanes hold the 32-K block's partial dots; the
+    // int32->f32 convert + scale use scalar arith (small M decode path). ---
+    auto vrmpyFn = declareHmxIntrinsic(
+        module, rewriter, "llvm.hexagon.V6.vrmpybv.128B", {v32i32, v32i32},
+        v32i32);
+    if (failed(vrmpyFn))
+      return failure();
+
+    auto cst = [&](int64_t v) -> Value {
+      return rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
+                                               rewriter.getI32IntegerAttr(v));
+    };
+    auto gepI8 = [&](Value base, Value byteOff) -> Value {
+      return rewriter.create<LLVM::GEPOp>(loc, ptrTy, i8Ty, base,
+                                          ValueRange{byteOff});
+    };
+    auto call1 = [&](FailureOr<FlatSymbolRefAttr> fn, Type retTy,
+                     ValueRange args) -> Value {
+      return rewriter.create<LLVM::CallOp>(loc, TypeRange{retTy}, *fn, args)
+          .getResult();
+    };
+
+    // --- Memref descriptors / base pointers / strides. ---
+    Value outPtr = alignedPtr(rewriter, loc, adaptor.getOut());
+    Value actPtr = alignedPtr(rewriter, loc, adaptor.getAct());
+    Value wtPtr = alignedPtr(rewriter, loc, adaptor.getWt());
+    MemRefDescriptor outDesc(adaptor.getOut());
+    MemRefDescriptor actDesc(adaptor.getAct());
+
+    Value M = outDesc.size(rewriter, loc, 0);
+    Value N = outDesc.size(rewriter, loc, 1);
+    Value outRowStrideElt = outDesc.stride(rewriter, loc, 0);
+    Value actRowStride = actDesc.stride(rewriter, loc, 0);
+    Value K = adaptor.getK();
+
+    auto toI32 = [&](Value v) -> Value {
+      if (v.getType() == i32Ty)
+        return v;
+      return rewriter.create<LLVM::TruncOp>(loc, i32Ty, v);
+    };
+    M = toI32(M);
+    N = toI32(N);
+    outRowStrideElt = toI32(outRowStrideElt);
+    actRowStride = toI32(actRowStride);
+
+    Value c0 = cst(0);
+    Value c1 = cst(1);
+    Value c2 = cst(2);
+    Value c4 = cst(4);
+    Value c32 = cst(32);
+    Value c128i = cst(128);
+    Value c1152 = cst(1152);
+    auto v32i8Ty = VectorType::get({32}, i8Ty);
+    Value zero32i8 = rewriter.create<LLVM::ZeroOp>(loc, v32i8Ty);
+    // nKt = K / 32 (crouton K-blocks).
+    Value nKt = rewriter.create<LLVM::SDivOp>(loc, K, c32);
+
+    // Widen a <32xi8> (32 K-contiguous int8) into the low 32 bytes of a 128-byte
+    // vrmpy operand (rest zero -> contributes 0 to the dot). One shufflevector:
+    // mask lanes 0..31 take src[0..31], lanes 32..127 take the zero src's lane 0.
+    SmallVector<int32_t, 128> widenMask(128);
+    for (int b = 0; b < 32; b++) widenMask[b] = b;
+    for (int b = 32; b < 128; b++) widenMask[b] = 32; // -> zero src lane 0
+    auto widen32To128 = [&](Value v32) -> Value {
+      Value sh = rewriter.create<LLVM::ShuffleVectorOp>(loc, v32, zero32i8,
+                                                        widenMask);
+      return rewriter.create<LLVM::BitcastOp>(loc, v32i32, sh);
+    };
+    // Gather the 32 K-contiguous int8 of (row r within tile, block) from the
+    // crouton qz region: krow[2*i+p] = qz[i*64 + r*2 + p]. The 16 i16 loads at
+    // stride 64 (each i16 = the p=0,p=1 byte pair for colpair i) ARE the gather
+    // (crouton's baked HMX transpose); bitcast the <16xi16> straight to <32xi8>.
+    auto gatherKrow = [&](Value qzBase, Value r2) -> Value {
+      Value hw = rewriter.create<LLVM::UndefOp>(loc, v16i16);
+      for (int i = 0; i < 16; i++) {
+        Value off = rewriter.create<LLVM::AddOp>(loc, r2, cst(i * 64));
+        Value p = gepI8(qzBase, off);
+        Value v = rewriter.create<LLVM::LoadOp>(loc, i16Ty, p, /*align=*/1)
+                      .getResult();
+        hw = rewriter.create<LLVM::InsertElementOp>(loc, hw, v, cst(i));
+      }
+      Value krow32 = rewriter.create<LLVM::BitcastOp>(loc, v32i8Ty, hw);
+      return widen32To128(krow32);
+    };
+    // Load the 32 act int8 of block kt (q8x4x2 quants, K-contiguous) as one
+    // unaligned <32xi8> vector load, widen into the 128-byte vrmpy operand.
+    auto loadActBlk = [&](Value actRowBase, Value actQOff) -> Value {
+      Value p = gepI8(actRowBase, actQOff);
+      Value v = rewriter.create<LLVM::LoadOp>(loc, v32i8Ty, p, /*align=*/1)
+                    .getResult();
+      return widen32To128(v);
+    };
+    // Sum the low 8 int32 lanes of the vrmpy result (32 K = 8 groups of 4).
+    auto sum8Lanes = [&](Value v) -> Value {
+      Value acc = rewriter.create<LLVM::ExtractElementOp>(loc, v, cst(0));
+      for (int i = 1; i < 8; i++) {
+        Value e = rewriter.create<LLVM::ExtractElementOp>(loc, v, cst(i));
+        acc = rewriter.create<LLVM::AddOp>(loc, acc, e);
+      }
+      return acc; // i32
+    };
+
+    // ---- Build the M/N/kt scalar loop nest with explicit basic blocks. ----
+    Block *origBlock = rewriter.getInsertionBlock();
+    Block *contBlock =
+        rewriter.splitBlock(origBlock, rewriter.getInsertionPoint());
+
+    // M loop
+    Block *mHeader = rewriter.createBlock(contBlock, {i32Ty}, {loc});
+    Block *mBody = rewriter.createBlock(contBlock);
+    rewriter.setInsertionPointToEnd(origBlock);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, mHeader);
+
+    rewriter.setInsertionPointToEnd(mHeader);
+    Value m = mHeader->getArgument(0);
+    Value mCond =
+        rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, m, M);
+    rewriter.create<LLVM::CondBrOp>(loc, mCond, mBody, ValueRange{}, contBlock,
+                                    ValueRange{});
+
+    // m body: act row base, out row element base.
+    rewriter.setInsertionPointToEnd(mBody);
+    Value mActOff = rewriter.create<LLVM::MulOp>(loc, m, actRowStride);
+    Value actRowBase = gepI8(actPtr, mActOff);
+    Value mOutElt = rewriter.create<LLVM::MulOp>(loc, m, outRowStrideElt);
+
+    // N loop
+    Block *nHeader = rewriter.createBlock(contBlock, {i32Ty}, {loc});
+    Block *nBody = rewriter.createBlock(contBlock);
+    Block *mLatch = rewriter.createBlock(contBlock);
+    rewriter.setInsertionPointToEnd(mBody);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, nHeader);
+
+    rewriter.setInsertionPointToEnd(nHeader);
+    Value n = nHeader->getArgument(0);
+    Value nCond =
+        rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, n, N);
+    rewriter.create<LLVM::CondBrOp>(loc, nCond, nBody, ValueRange{}, mLatch,
+                                    ValueRange{});
+
+    rewriter.setInsertionPointToEnd(mLatch);
+    Value mNext = rewriter.create<LLVM::AddOp>(loc, m, c1);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{mNext}, mHeader);
+
+    // n body: nt = n/32, r = n%32, r2 = r*2; weight tile column base = nt*nKt.
+    // wt scale byte offset within a tile = r*4 (sv[r*2] fp16).
+    rewriter.setInsertionPointToEnd(nBody);
+    Value nt = rewriter.create<LLVM::SDivOp>(loc, n, c32);
+    Value r = rewriter.create<LLVM::SRemOp>(loc, n, c32);
+    Value r2 = rewriter.create<LLVM::MulOp>(loc, r, c2);
+    Value r4 = rewriter.create<LLVM::MulOp>(loc, r, c4);
+    Value ntKt = rewriter.create<LLVM::MulOp>(loc, nt, nKt); // tile index base
+
+    // kt loop: carry (kt, accF32 : f32)
+    Block *ktHeader =
+        rewriter.createBlock(contBlock, {i32Ty, f32Ty}, {loc, loc});
+    Block *ktBody = rewriter.createBlock(contBlock);
+    Block *ktExit = rewriter.createBlock(contBlock, {f32Ty}, {loc});
+    rewriter.setInsertionPointToEnd(nBody);
+    Value zeroF = rewriter.create<LLVM::ConstantOp>(
+        loc, f32Ty, rewriter.getF32FloatAttr(0.0f));
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0, zeroF}, ktHeader);
+
+    rewriter.setInsertionPointToEnd(ktHeader);
+    Value kt = ktHeader->getArgument(0);
+    Value accF = ktHeader->getArgument(1);
+    Value ktCond =
+        rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, kt, nKt);
+    rewriter.create<LLVM::CondBrOp>(loc, ktCond, ktBody, ValueRange{}, ktExit,
+                                    ValueRange{accF});
+
+    // kt body: gather krow, load act block, vrmpy, sum8, scale-after-accum.
+    rewriter.setInsertionPointToEnd(ktBody);
+    // tile (nt,kt): src byte off = (ntKt + kt)*1152. qz at +128, sv at +0.
+    Value tileIdx = rewriter.create<LLVM::AddOp>(loc, ntKt, kt);
+    Value tileOff = rewriter.create<LLVM::MulOp>(loc, tileIdx, c1152);
+    Value tileBase = gepI8(wtPtr, tileOff);
+    Value qzBase = gepI8(tileBase, c128i);
+    Value krowVec = gatherKrow(qzBase, r2);
+    // act block: q8x4x2 quants at actRowBase + kt*32; act fp16 scale at +K+kt*2.
+    Value actQOff = rewriter.create<LLVM::MulOp>(loc, kt, c32);
+    Value actVec = loadActBlk(actRowBase, actQOff);
+    Value rmpy = call1(vrmpyFn, v32i32, ValueRange{krowVec, actVec});
+    Value intDot = sum8Lanes(rmpy); // i32
+    Value intDotF = rewriter.create<LLVM::SIToFPOp>(loc, f32Ty, intDot);
+    // wt scale: sv[r*2] fp16 at tileBase + r*4.
+    Value wsPtr = gepI8(tileBase, r4);
+    Value wsHalf = rewriter.create<LLVM::LoadOp>(loc, f16Ty, wsPtr, /*align=*/2)
+                       .getResult();
+    Value wsF = rewriter.create<LLVM::FPExtOp>(loc, f32Ty, wsHalf);
+    // act scale: fp16 at actRowBase + K + kt*2.
+    Value asOff0 = rewriter.create<LLVM::MulOp>(loc, kt, c2);
+    Value asOff = rewriter.create<LLVM::AddOp>(loc, K, asOff0);
+    Value asPtr = gepI8(actRowBase, asOff);
+    Value asHalf = rewriter.create<LLVM::LoadOp>(loc, f16Ty, asPtr, /*align=*/2)
+                       .getResult();
+    Value asF = rewriter.create<LLVM::FPExtOp>(loc, f32Ty, asHalf);
+    Value dd = rewriter.create<LLVM::FMulOp>(loc, wsF, asF);
+    Value contrib = rewriter.create<LLVM::FMulOp>(loc, intDotF, dd);
+    Value accNext = rewriter.create<LLVM::FAddOp>(loc, accF, contrib);
+    Value ktNext = rewriter.create<LLVM::AddOp>(loc, kt, c1);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{ktNext, accNext}, ktHeader);
+
+    // kt exit: store out[m][n] = accF.
+    rewriter.setInsertionPointToEnd(ktExit);
+    Value outIdx = rewriter.create<LLVM::AddOp>(loc, mOutElt, n);
+    Value outElemPtr = rewriter.create<LLVM::GEPOp>(loc, ptrTy, f32Ty, outPtr,
+                                                    ValueRange{outIdx});
+    rewriter.create<LLVM::StoreOp>(loc, ktExit->getArgument(0), outElemPtr,
+                                   /*align=*/4);
+    Value nNext = rewriter.create<LLVM::AddOp>(loc, n, c1);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{nNext}, nHeader);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Lower hexkl::HvxLayoutWeightOp -> inline HVX vscattermhw weight-half layout
 //===----------------------------------------------------------------------===//
 //
@@ -2261,6 +2533,9 @@ void populateHexKLToLLVMConversionPatterns(LLVMTypeConverter &converter,
   patterns.add<LowerHmxCoreDot>(converter);
   // Lower the int8-vrmpy 1-touch matmul to inline HVX vrmpybv + scale-after.
   patterns.add<LowerMatmulVrmpyQ8>(converter);
+  // Decode-path vrmpy variant reading the CROUTON weight layout (per-row
+  // gather), env-gated by HEXKL_VRMPY_CROUTON in the decompose pass.
+  patterns.add<LowerMatmulVrmpyCrouton>(converter);
   // Lower the fast HVX weight-half layout to inline vscatter.
   patterns.add<LowerHvxLayoutWeight>(converter);
   // Lower the fused Q8 dequant + weight-half layout to inline HVX.

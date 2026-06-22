@@ -378,6 +378,41 @@ def HexKL_MatmulVrmpyQ8Op
     "`(` $out `,` $act `,` $wt `,` $k `)` `:` type($out) `,` type($act) `,` type($wt) `,` type($k) attr-dict";
 }
 
+def HexKL_MatmulVrmpyCroutonOp
+  : HexKL_Op<"matmul_vrmpy_crouton", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "HVX int8-vrmpy 1-touch matmul: q8x4x2 activation x CROUTON weight";
+  let description = [{
+    Decode-path (small M) sibling of `hexkl.matmul_vrmpy_q8`. Computes
+    out[M][N] f32 = act[M][K] (q8x4x2 int8) * weight (CROUTON 1152B-tile int8),
+    via Q6_Vw_vrmpy_VbVb int8 x int8 -> int32, scale applied AFTER accumulation.
+
+    The activation is the SAME q8x4x2 layout as matmul_vrmpy_q8:
+    `[K int8 quants][(K/32) fp16 scales]`, row_stride = K + (K/32)*2.
+
+    The weight is the OmniOp CROUTON tile layout (host `repack_q8_0_crouton`):
+    per (nt,kt) tile of 1152 bytes, tile order [nt][kt] with nt=N/32, kt=K/32:
+      bytes   0..127 : `sv` = 64 fp16 dup-scales, sv[r*2]=sv[r*2+1]=blk[nt*32+r].d
+      bytes 128..1151 : `qz` = int8, qz[i*64 + r*2 + p] for colpair i=0..15,
+                        row r=0..31, pair-elem p=0,1.
+    For output row n (nt=n/32, r=n%32) and K-block kt, the 32 K int8 are SCATTERED
+    at stride 64: qz[i*64 + r*2 + p]. The lowering GATHERS them K-contiguous
+    (krow[2*i+p] = qz[i*64+r*2+p]) before the vrmpy, and pulls the row's fp16
+    scale from sv[r*2] (the dup-scale drops in directly, no reshuffle). This
+    mirrors PATH B of hmx-spike-compiler/spike_vrmpy_crouton.c (max_abs 1.7e-5).
+
+    `k` is the runtime K (multiple of 32). N is derived from out's size1.
+  }];
+  let arguments = (ins
+    AnyNon0RankedMemRef:$out,   // f32 [M][N]
+    AnyNon0RankedMemRef:$act,   // i8  [M][a_stride]  q8x4x2
+    AnyNon0RankedMemRef:$wt,    // i8  crouton tiles (nt*kt)*1152, flat
+    I32:$k
+  );
+  let results = (outs);
+  let assemblyFormat =
+    "`(` $out `,` $act `,` $wt `,` $k `)` `:` type($out) `,` type($act) `,` type($wt) `,` type($k) attr-dict";
+}
+
 def HexKL_HvxLayoutActivationOp
   : HexKL_Op<"hvx_layout_activation",
       [MemoryEffects<[MemRead, MemWrite]>]> {
