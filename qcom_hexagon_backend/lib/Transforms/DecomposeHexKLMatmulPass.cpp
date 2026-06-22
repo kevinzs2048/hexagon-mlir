@@ -326,8 +326,14 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
       return success();
     }
 
-    // Tile counts (index + i32).
-    Value mTiles = rewriter.create<arith::DivUIOp>(loc, dimM, idx32);
+    // Tile counts (index + i32). M is CEIL-divided so a raw M not a multiple of
+    // 32 still gets a full tile (truncating DivUI -> mTiles=0 for M<32 -> garbage
+    // output). On the prefill/decode paths the shim always pads M to a multiple
+    // of 32, so this matches the prior value there; the ceil only changes the
+    // unpadded-M case (a latent correctness fix, no effect on the padded path).
+    Value idx31 = rewriter.create<arith::ConstantIndexOp>(loc, 31);
+    Value dimMCeil = rewriter.create<arith::AddIOp>(loc, dimM, idx31);
+    Value mTiles = rewriter.create<arith::DivUIOp>(loc, dimMCeil, idx32);
     Value nTiles = rewriter.create<arith::DivUIOp>(loc, dimN, idx32);
     Value mTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, mTiles);
     Value nTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, nTiles);
@@ -369,8 +375,12 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     // the alloc may still exceed VTCM -> the DSP would fault; for Qwen3
     // (K<=8192) one column + full-K act always fits, so this is a guard only.
     Value availWt = rewriter.create<arith::SubIOp>(loc, budgetTilesC, fixedTiles);
-    // max(availWt, kTiles) so chunk_nt >= 1 even under pressure.
+    // max(availWt, kTiles) so chunk_nt >= 1 even under pressure. SIGNED max
+    // (MaxSI): availWt = budget - fixed can go NEGATIVE under VTCM pressure, and
+    // we want it clamped UP to kTiles, not wrapped to a huge unsigned value.
     Value availClamped = rewriter.create<arith::MaxSIOp>(loc, availWt, kTiles);
+    // UNSIGNED div (DivUI): both operands are now >= kTiles > 0 (non-negative
+    // after the MaxSI clamp), so unsigned division is correct and cheaper.
     Value chunkNtRaw =
         rewriter.create<arith::DivUIOp>(loc, availClamped, kTiles);
     // min(chunkNtRaw, nTiles): never chunk wider than the matrix.
@@ -380,7 +390,6 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     // N-chunking is exercised only on the Q8/CROUTON prefill path.
     if (!enableQ8Weight)
       chunkNt = nTiles;
-    Value chunkNtI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, chunkNt);
 
     // wt region is sized for ONE chunk (chunk_nt * kTiles tiles).
     Value chunkNkTiles = rewriter.create<arith::MulIOp>(loc, chunkNt, kTiles);
