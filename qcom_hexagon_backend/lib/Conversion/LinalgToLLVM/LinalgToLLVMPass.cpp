@@ -340,7 +340,9 @@ public:
       pm.addNestedPass<func::FuncOp>(createConvertToHexagonmemPass());
 
     // Decompose hexkl.matmul to micro ops (or inline hexkl.hmx_core_dot).
-    if (enableHexKL) {
+    // enableExternalMatmul skips decompose so hexkl.matmul lowers to a single
+    // external hexkl_matmul_f16f16_f32 call (LowerMatmul) instead.
+    if (enableHexKL && !enableExternalMatmul) {
       DecomposeHexKLMatmulOptions decomposeOpts;
       decomposeOpts.useInlineHMX = enableInlineHMX;
       decomposeOpts.enableQ8Weight = enableQ8Weight;

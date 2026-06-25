@@ -63,6 +63,9 @@ class HexagonOptions:
     enableQ8Weight: bool = (
         False  # fuse Q8_0 dequant into the inline-HMX weight layout (needs enableInlineHMX)
     )
+    enableExternalMatmul: bool = (
+        False  # route hexkl.matmul to a single external hexkl_matmul_f16f16_f32 call (skip decompose)
+    )
     enableMultiThreading: bool = False  # linalg-generic based multi-threading
     enableSCFThreading: bool = False  # scf based multi-threading
     enableSplitReduction: bool = False  # split-reduction optimization
