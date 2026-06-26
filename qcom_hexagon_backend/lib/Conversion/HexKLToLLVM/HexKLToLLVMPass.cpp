@@ -2606,6 +2606,50 @@ struct LowerMatmulVrmpyQ8TLE
   }
 };
 
+// Generic TLE-Raw leaf lowering: one whole-kernel hexkl.tle_raw_call -> one
+// llvm.call into a hand-written core named by the op's `callee` attr. operands[0]
+// is the out memref; n is its element count (product of dim sizes). Mirrors
+// LowerMatmulVrmpyQ8TLE but operand-count agnostic. Gated by HEXKL_TLE_RAW at
+// registration so it only appears in TLE compiles.
+struct LowerTLERawCall : public ConvertOpToLLVMPattern<hexkl::TLERawCallOp> {
+  using ConvertOpToLLVMPattern<hexkl::TLERawCallOp>::ConvertOpToLLVMPattern;
+  LogicalResult matchAndRewrite(hexkl::TLERawCallOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    auto i32Ty = rewriter.getI32Type();
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+
+    SmallVector<Value> operands;
+    SmallVector<Type> argTys;
+    for (Value m : adaptor.getOperands()) {
+      operands.push_back(alignedPtr(rewriter, loc, m));
+      argTys.push_back(ptrTy);
+    }
+    // n = product of out memref (operands[0]) dim sizes.
+    MemRefDescriptor outDesc(adaptor.getOperands()[0]);
+    auto outMemTy = cast<MemRefType>(op.getOperands()[0].getType());
+    Value nAccum;  // accumulate the size product in the same type size() returns
+    for (int64_t d = 0; d < outMemTy.getRank(); ++d) {
+      Value sz = outDesc.size(rewriter, loc, d);
+      nAccum = d == 0 ? sz : rewriter.create<LLVM::MulOp>(loc, nAccum, sz);
+    }
+    Value n = castToI32(rewriter, loc, nAccum);
+    operands.push_back(n);
+    argTys.push_back(i32Ty);
+
+    auto fn = LLVM::lookupOrCreateFn(rewriter, module, op.getCallee(),
+                                     argTys, voidTy);
+    if (failed(fn))
+      return failure();
+    auto fnCallee = FlatSymbolRefAttr::get((*fn).getOperation());
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, TypeRange{}, fnCallee, operands);
+    return success();
+  }
+};
+
 void populateHexKLToLLVMConversionPatterns(LLVMTypeConverter &converter,
                                            RewritePatternSet &patterns) {
   // Keep existing matmul lowering.
@@ -2624,6 +2668,10 @@ void populateHexKLToLLVMConversionPatterns(LLVMTypeConverter &converter,
     patterns.add<LowerMatmulVrmpyQ8TLE>(converter);
   else
     patterns.add<LowerMatmulVrmpyQ8>(converter);
+  // HEXKL_TLE_RAW: register the generic TLE-Raw leaf lowering so recognized
+  // whole-kernel ops (add, ...) lower to a single hand-written-core call.
+  if (::getenv("HEXKL_TLE_RAW"))
+    patterns.add<LowerTLERawCall>(converter);
   // Decode-path vrmpy variant reading the CROUTON weight layout (per-row
   // gather), env-gated by HEXKL_VRMPY_CROUTON in the decompose pass.
   patterns.add<LowerMatmulVrmpyCrouton>(converter);
