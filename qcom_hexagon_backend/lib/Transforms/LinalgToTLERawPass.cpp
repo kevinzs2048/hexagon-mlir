@@ -34,6 +34,7 @@ namespace {
 static const llvm::StringMap<StringRef> &tleRegistry() {
   static const llvm::StringMap<StringRef> reg = {
       {"compiler_add", "triton_add_raw_tle"},
+      {"compiler_swiglu", "triton_swiglu_raw_tle"},
   };
   return reg;
 }
