@@ -230,6 +230,13 @@ def MatmulToHexKL :
   let constructor = "hexagon::createMatmulToHexKLPass()";
 }
 
+def LinalgToTLERaw :
+    InterfacePass<"linalg-to-tle-raw", "mlir::FunctionOpInterface"> {
+  let summary = "Recognize a TLE-backed kernel (by func name) and rewrite its "
+                "elementwise linalg.generic to a single hexkl.tle_raw_call";
+  let constructor = "hexagon::createLinalgToTLERawPass()";
+}
+
 def DecomposeHexKLMatmul :
     InterfacePass<"decompose-hexkl-matmul", "mlir::FunctionOpInterface"> {
   let summary = "Decompose hexkl.matmul into hexkl micro HMX operations";

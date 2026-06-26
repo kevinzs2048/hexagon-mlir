@@ -15,6 +15,7 @@ add_mlir_library(Transforms
   DecomposeTensorConcatPass.cpp
   MatmulToConvPass.cpp
   MatmulToHexKLPass.cpp
+  LinalgToTLERawPass.cpp
   CopyCanonicalizationPass.cpp
   DecomposeHexKLMatmulPass.cpp
   ConvTilingPass.cpp

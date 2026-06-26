@@ -82,6 +82,8 @@ std::unique_ptr<OperationPass<func::FuncOp>> createMatmulToConvPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>> createMatmulToHexKLPass();
 
+std::unique_ptr<InterfacePass<FunctionOpInterface>> createLinalgToTLERawPass();
+
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createDecomposeHexKLMatmulPass();
 std::unique_ptr<InterfacePass<FunctionOpInterface>>

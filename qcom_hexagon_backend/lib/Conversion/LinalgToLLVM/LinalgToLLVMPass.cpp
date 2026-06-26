@@ -350,6 +350,12 @@ public:
           createDecomposeHexKLMatmulPass(decomposeOpts));
     }
 
+    // HEXKL_TLE_RAW: recognize TLE-backed kernels (add, ...) and rewrite their
+    // elementwise linalg.generic to a single hexkl.tle_raw_call, lowered later by
+    // HexKLToLLVM's LowerTLERawCall. Runs post-bufferization (memref operands).
+    if (::getenv("HEXKL_TLE_RAW"))
+      pm.addNestedPass<func::FuncOp>(createLinalgToTLERawPass());
+
     // Lower linalg ops with library_call attribute set to custom fns.
     pm.addPass(createHexagonReplaceWithLibraryCallsPass());
     if (enableHexagonmemCopyToDMA)

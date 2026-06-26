@@ -81,6 +81,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerDecomposeTensorConcatPass();
   mlir::hexagon::registerMatmulToConvPass();
   mlir::hexagon::registerMatmulToHexKLPass();
+  mlir::hexagon::registerLinalgToTLERawPass();
   mlir::hexagon::registerDecomposeHexKLMatmulPass();
   mlir::hexagon::registerConvTilingPass();
   mlir::hexagon::registerDMAToLLVMPass();
