@@ -60,6 +60,12 @@ target_link_libraries(linalg-hexagon-opt PRIVATE
     # tests
     TritonTestAnalysis
 
+    # TritonGPUIR/TritonNvidiaGPUIR (pulled in via dialect_libs) reference symbols
+    # (inferDstEncoding, getTMABlockShape, verifyBarrierType) defined in their
+    # Transforms libs; link them so the opt tool resolves at link time.
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
+
     LLVMCore
     LLVMSupport
     LLVMOption
