@@ -413,6 +413,29 @@ def HexKL_MatmulVrmpyCroutonOp
     "`(` $out `,` $act `,` $wt `,` $k `)` `:` type($out) `,` type($act) `,` type($wt) `,` type($k) attr-dict";
 }
 
+def HexKL_TLERawCallOp
+  : HexKL_Op<"tle_raw_call", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Lower a recognized whole-kernel op to ONE call into a hand-written TLE-Raw core";
+  let description = [{
+    Generic leaf op for the TLE-Raw framework-lowering path. A recognition pass
+    (LinalgToTLERawPass) rewrites a whole recognized kernel (e.g. the elementwise
+    add kernel) into a single tle_raw_call whose `callee` names the hand-written
+    core to invoke. By convention `operands[0]` is the OUTPUT memref and the rest
+    are INPUT memrefs, in the core's C-ABI order. The lowering (LowerTLERawCall)
+    extracts each memref's aligned base pointer, derives the element count `n` from
+    the output memref descriptor (product of dim sizes), and emits exactly one
+    `llvm.call @callee(ptr..., i32 n)`. No threading/tiling is introduced here;
+    orchestration stays in the caller (llama.cpp shim).
+  }];
+  let arguments = (ins
+    Variadic<AnyNon0RankedMemRef>:$operands,   // operands[0] = out, rest = inputs
+    StrAttr:$callee                            // hand-written core symbol name
+  );
+  let results = (outs);
+  let assemblyFormat =
+    "$callee `(` $operands `)` `:` type($operands) attr-dict";
+}
+
 def HexKL_HvxLayoutActivationOp
   : HexKL_Op<"hvx_layout_activation",
       [MemoryEffects<[MemRead, MemWrite]>]> {
