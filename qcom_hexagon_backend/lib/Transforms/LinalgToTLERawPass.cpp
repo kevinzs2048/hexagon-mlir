@@ -36,6 +36,7 @@ static const llvm::StringMap<StringRef> &tleRegistry() {
       {"compiler_add", "triton_add_raw_tle"},
       {"compiler_swiglu", "triton_swiglu_raw_tle"},
       {"compiler_rms", "triton_rms_raw_tle"},
+      {"compiler_rope", "triton_rope_raw_tle"},
   };
   return reg;
 }
