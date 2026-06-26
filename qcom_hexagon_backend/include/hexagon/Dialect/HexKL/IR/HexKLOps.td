@@ -428,8 +428,9 @@ def HexKL_TLERawCallOp
     orchestration stays in the caller (llama.cpp shim).
   }];
   let arguments = (ins
-    Variadic<AnyNon0RankedMemRef>:$operands,   // operands[0] = out, rest = inputs
-    StrAttr:$callee                            // hand-written core symbol name
+    Variadic<AnyType>:$operands,   // leading memrefs (operands[0]=out, rest=inputs),
+                                   // then optional trailing scalar operands (e.g. eps)
+    StrAttr:$callee                // hand-written core symbol name
   );
   let results = (outs);
   let assemblyFormat =

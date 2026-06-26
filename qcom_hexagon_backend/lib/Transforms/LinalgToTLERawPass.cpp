@@ -35,6 +35,7 @@ static const llvm::StringMap<StringRef> &tleRegistry() {
   static const llvm::StringMap<StringRef> reg = {
       {"compiler_add", "triton_add_raw_tle"},
       {"compiler_swiglu", "triton_swiglu_raw_tle"},
+      {"compiler_rms", "triton_rms_raw_tle"},
   };
   return reg;
 }
@@ -61,6 +62,13 @@ struct RecognizeTLEKernel final : public OpRewritePattern<linalg::GenericOp> {
     operands.push_back(op.getDpsInitOperand(0)->get());
     for (OpOperand *in : op.getDpsInputOperands())
       operands.push_back(in->get());
+    // Append the enclosing func's scalar (non-memref) arguments as trailing
+    // scalar operands (e.g. f32 eps for rms). The func's memref args are the
+    // generic's in/out (already added); only scalars are appended. The lowering
+    // passes these after the derived n.
+    for (Value arg : func.getArguments())
+      if (!isa<mlir::MemRefType>(arg.getType()))
+        operands.push_back(arg);
 
     rewriter.replaceOpWithNewOp<hexkl::TLERawCallOp>(
         op, TypeRange{}, operands, rewriter.getStringAttr(callee));

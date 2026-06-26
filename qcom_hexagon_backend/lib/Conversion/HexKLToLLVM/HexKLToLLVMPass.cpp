@@ -2622,11 +2622,20 @@ struct LowerTLERawCall : public ConvertOpToLLVMPattern<hexkl::TLERawCallOp> {
     auto ptrTy = LLVM::LLVMPointerType::get(ctx);
     auto voidTy = LLVM::LLVMVoidType::get(ctx);
 
-    SmallVector<Value> operands;
-    SmallVector<Type> argTys;
-    for (Value m : adaptor.getOperands()) {
-      operands.push_back(alignedPtr(rewriter, loc, m));
-      argTys.push_back(ptrTy);
+    // Leading operands are memrefs (out, inputs) -> aligned ptrs; trailing
+    // non-memref operands are scalars (e.g. f32 eps) passed through directly.
+    // Call ABI = (ptr..., i32 n, scalars...).
+    SmallVector<Value> ptrArgs, scalarArgs;
+    SmallVector<Type> ptrTys, scalarTys;
+    for (auto it : llvm::zip(op.getOperands(), adaptor.getOperands())) {
+      Value orig = std::get<0>(it), conv = std::get<1>(it);
+      if (isa<MemRefType>(orig.getType())) {
+        ptrArgs.push_back(alignedPtr(rewriter, loc, conv));
+        ptrTys.push_back(ptrTy);
+      } else {
+        scalarArgs.push_back(conv);
+        scalarTys.push_back(conv.getType());
+      }
     }
     // n = product of out memref (operands[0]) dim sizes.
     MemRefDescriptor outDesc(adaptor.getOperands()[0]);
@@ -2637,8 +2646,13 @@ struct LowerTLERawCall : public ConvertOpToLLVMPattern<hexkl::TLERawCallOp> {
       nAccum = d == 0 ? sz : rewriter.create<LLVM::MulOp>(loc, nAccum, sz);
     }
     Value n = castToI32(rewriter, loc, nAccum);
+
+    SmallVector<Value> operands(ptrArgs);
+    SmallVector<Type> argTys(ptrTys);
     operands.push_back(n);
     argTys.push_back(i32Ty);
+    operands.append(scalarArgs.begin(), scalarArgs.end());
+    argTys.append(scalarTys.begin(), scalarTys.end());
 
     auto fn = LLVM::lookupOrCreateFn(rewriter, module, op.getCallee(),
                                      argTys, voidTy);
