@@ -311,6 +311,24 @@ SmallVector<unsigned> calculateTileSizeLowerBounds(linalg::LinalgOp op) {
   DBG("-> Lower bounds: {" << toString(lowerBounds) << "}");
   return lowerBounds;
 }
+
+bool isNoReuseElementwiseGeneric(linalg::LinalgOp op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op.getOperation());
+  if (!genericOp)
+    return false;
+
+  if (!genericOp.hasPureTensorSemantics() || !genericOp->getNumResults() ||
+      genericOp.getNumLoops() < 1)
+    return false;
+
+  for (auto iterType : genericOp.getIteratorTypesArray())
+    if (iterType != utils::IteratorType::parallel)
+      return false;
+
+  return llvm::all_of(genericOp.getIndexingMapsArray(), [](AffineMap map) {
+    return map.isProjectedPermutation();
+  });
+}
 } // namespace
 
 namespace mlir {
@@ -484,6 +502,11 @@ getVTCMTilingOptions(linalg::LinalgOp op,
       op.getNumLoops() < 1) {
     DBG("-> get vtcm tiling options aborted. Constraints not "
         "satisfied.");
+    return failure();
+  }
+
+  if (!userProvidedTileSizes && isNoReuseElementwiseGeneric(op)) {
+    DBG("-> get vtcm tiling options skipped for no-reuse elementwise generic.");
     return failure();
   }
 
