@@ -17,6 +17,7 @@
 #include "hexagon/Transforms/Transforms.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
@@ -60,6 +61,24 @@ static Value makeF32LikeConst(PatternRewriter &rewriter, Location loc,
   }
   // Scalar f32.
   return rewriter.create<arith::ConstantOp>(loc, rewriter.getF32FloatAttr(val));
+}
+
+// Returns true for scalar f32 1.0 or vector<f32> splat 1.0 constants.
+static bool isF32LikeConstant(Value value, double expected) {
+  auto constOp = value.getDefiningOp<arith::ConstantOp>();
+  if (!constOp)
+    return false;
+
+  Attribute attr = constOp.getValue();
+  if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+    return floatAttr.getValueAsDouble() == expected;
+  if (auto denseAttr = dyn_cast<DenseElementsAttr>(attr)) {
+    if (!denseAttr.isSplat())
+      return false;
+    auto splatValue = denseAttr.getSplatValue<APFloat>();
+    return splatValue.convertToDouble() == expected;
+  }
+  return false;
 }
 
 // Make an i32 constant (scalar or splat vector) with the
@@ -131,6 +150,78 @@ static Value buildQuakeRsqrt(PatternRewriter &rewriter, Location loc, Value x) {
   return yrefb;
 }
 
+static bool isExpOfNegated(Value value, Value &input) {
+  auto expOp = value.getDefiningOp<math::ExpOp>();
+  if (expOp) {
+    Value expInput = expOp.getOperand();
+    if (auto negOp = expInput.getDefiningOp<arith::NegFOp>()) {
+      input = negOp.getOperand();
+      return true;
+    }
+  }
+
+  auto llvmExpOp = value.getDefiningOp<LLVM::ExpOp>();
+  if (llvmExpOp) {
+    Value expInput = llvmExpOp.getOperand();
+    if (auto negOp = expInput.getDefiningOp<arith::NegFOp>()) {
+      input = negOp.getOperand();
+      return true;
+    }
+    if (auto negOp = expInput.getDefiningOp<LLVM::FNegOp>()) {
+      input = negOp.getOperand();
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool isOnePlusExpNeg(Value value, Value &input) {
+  auto addOp = value.getDefiningOp<arith::AddFOp>();
+  if (!addOp)
+    return false;
+
+  if (isF32LikeConstant(addOp.getLhs(), 1.0) &&
+      isExpOfNegated(addOp.getRhs(), input))
+    return true;
+  if (isF32LikeConstant(addOp.getRhs(), 1.0) &&
+      isExpOfNegated(addOp.getLhs(), input))
+    return true;
+  return false;
+}
+
+// Pattern: 1 / (1 + exp(-x)) -> 0.5 * tanh(0.5 * x) + 0.5.
+//
+// This keeps sigmoid-like elementwise kernels on vectorized Hexagon math while
+// avoiding the generic fast-inverse expansion for the reciprocal.
+struct SigmoidToTanhPattern : public OpRewritePattern<arith::DivFOp> {
+  using OpRewritePattern<arith::DivFOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::DivFOp divOp,
+                                PatternRewriter &rewriter) const override {
+    Value lhs = divOp.getLhs();
+    Value rhs = divOp.getRhs();
+    Type resultType = divOp.getType();
+
+    if (!isF32OrF32Vector(resultType) || !isF32LikeConstant(lhs, 1.0))
+      return failure();
+
+    Value input;
+    if (!isOnePlusExpNeg(rhs, input) || input.getType() != resultType)
+      return failure();
+
+    Location loc = divOp.getLoc();
+    Value half = makeF32LikeConst(rewriter, loc, resultType, 0.5f);
+    Value scaled = rewriter.create<arith::MulFOp>(loc, input, half);
+    Value tanh = rewriter.create<LLVM::TanhOp>(loc, resultType, scaled);
+    Value tanhHalf = rewriter.create<arith::MulFOp>(loc, tanh, half);
+    Value result = rewriter.create<arith::AddFOp>(loc, tanhHalf, half);
+
+    rewriter.replaceOp(divOp, result);
+    return success();
+  }
+};
+
 // Pattern: arith.divf %p, %q --> %p * rsqrt(%q * %q)
 
 struct DivToQuakeRsqrtPattern : public OpRewritePattern<arith::DivFOp> {
@@ -190,7 +281,8 @@ struct FastInversePass : public ::impl::FastInverseBase<FastInversePass> {
   void runOnOperation() override {
     auto moduleOp = getOperation();
     RewritePatternSet patterns(moduleOp.getContext());
-    patterns.insert<DivToQuakeRsqrtPattern>(patterns.getContext());
+    patterns.insert<SigmoidToTanhPattern, DivToQuakeRsqrtPattern>(
+        patterns.getContext());
     if (failed(applyPatternsGreedily(moduleOp, std::move(patterns)))) {
       return signalPassFailure();
     }
