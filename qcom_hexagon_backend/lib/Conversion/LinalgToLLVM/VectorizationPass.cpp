@@ -43,7 +43,6 @@ using namespace hexagon;
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h.inc"
 
 namespace {
-
 static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
   auto fnName = op->getAttrOfType<StringAttr>("library_call");
   if (fnName) {
@@ -60,7 +59,11 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
   auto innerLoopDim = op.getStaticLoopRanges()[numLoops - 1];
 
   auto dataTileSize = computeDataTileSize(op);
-  if (!dataTileSize ||
+  if (!dataTileSize)
+    return failure();
+
+  bool isDynamicInnerLoop = ShapedType::isDynamic(innerLoopDim);
+  if (!isDynamicInnerLoop &&
       !perfectlyVectorizable(dataTileSize.value(), innerLoopDim)) {
     DBG("-> skipping vectorization. data tile size and loop mismatch");
     return failure();
@@ -68,10 +71,14 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
 
   SmallVector<int64_t> vecSizes(numLoops, 1);
   SmallVector<bool> scalableDims(numLoops, false);
-  vecSizes[numLoops - 1] = innerLoopDim;
+  vecSizes[numLoops - 1] =
+      isDynamicInnerLoop ? dataTileSize.value() : innerLoopDim;
 
   FailureOr<mlir::linalg::VectorizationResult> vectorResults =
-      linalg::vectorize(rewriter, op, vecSizes, scalableDims);
+      linalg::vectorize(rewriter, op, vecSizes, scalableDims,
+                        /*vectorizeNDExtract=*/false,
+                        /*flatten1DDepthwiseConv=*/false,
+                        /*assumeDynamicDimsMatchVecSizes=*/isDynamicInnerLoop);
   if (failed(vectorResults))
     return failure();
   // Replace the original op with the vectorized op.
