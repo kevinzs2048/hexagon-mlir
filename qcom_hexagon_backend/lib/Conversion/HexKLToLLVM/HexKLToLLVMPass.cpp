@@ -1191,10 +1191,12 @@ struct LowerMatmulVrmpyQ8
 // scalar loads. Host-modeled bit-exact vs the per-row reference (4 PRNG seeds).
 //
 // Scaling stays per-kt-block (act/wt scales are per-32-K-group). Per kt: convert
-// the <32xi32> int dot to f32, multiply by the per-row wt scale vector (the 32
-// distinct sv[r*2] fp16 dup-scales, even-lane shuffled to <32xf32>) and the
-// scalar act fp16 scale, accumulate into a <32xf32> row accumulator. After the
-// kt loop, store 32 f32 outputs for the tile column (rows nt*32 .. nt*32+31).
+// the <32xi32> int dot to sf with Hexagon intrinsics, multiply by the per-row wt
+// fp16 scale vector and scalar act fp16 scale through qf32 intrinsics, then
+// accumulate as qf32/sf bits in a <32xi32>. This avoids generic vector<32xf32>
+// arithmetic, which crashes LLVM-19 Hexagon's widening-vector-float pass for
+// this loop shape. After the kt loop, bitcast the sf bits and store 32 f32
+// outputs for the tile column (rows nt*32 .. nt*32+31).
 //
 // Loop nest: M (rows) -> NT (N/32 tiles) -> KT (K/32 blocks) -> 8 colpair pairs.
 // Decode path: small M, N large; the 32-row tiling amortizes the de-transpose.
@@ -1210,14 +1212,11 @@ struct LowerMatmulVrmpyCrouton
     MLIRContext *ctx = rewriter.getContext();
 
     auto i8Ty = rewriter.getI8Type();
+    auto i16Ty = rewriter.getI16Type();
     auto i32Ty = rewriter.getI32Type();
-    auto f16Ty = rewriter.getF16Type();
     auto f32Ty = rewriter.getF32Type();
     auto ptrTy = LLVM::LLVMPointerType::get(ctx);
     auto v32i32 = VectorType::get({32}, i32Ty);
-    auto v32f32 = VectorType::get({32}, f32Ty);
-    auto v32f16 = VectorType::get({32}, f16Ty);
-    auto v64f16 = VectorType::get({64}, f16Ty);
     auto v128i8 = VectorType::get({128}, i8Ty);
 
     // Tag the enclosing llvm.func with HVX features (merge, preserve siblings).
@@ -1261,9 +1260,12 @@ struct LowerMatmulVrmpyCrouton
     auto addQf32MixFn = declareHmxIntrinsic(
         module, rewriter, "llvm.hexagon.V6.vadd.qf32.mix.128B",
         {v32i32, v32i32}, v32i32);
+    auto splatFn = declareHmxIntrinsic(module, rewriter,
+                                       "llvm.hexagon.V6.lvsplatw.128B",
+                                       {i32Ty}, v32i32);
     if (failed(vrmpyAccFn) || failed(vd0Fn) || failed(loFn) ||
         failed(convSfWFn) || failed(mpyQf32HfFn) || failed(convSfQf32Fn) ||
-        failed(mpyQf32SfFn) || failed(addQf32MixFn))
+        failed(mpyQf32SfFn) || failed(addQf32MixFn) || failed(splatFn))
       return failure();
 
     auto cst = [&](int64_t v) -> Value {
@@ -1391,25 +1393,25 @@ struct LowerMatmulVrmpyCrouton
     rewriter.setInsertionPointToEnd(ntBody);
     Value ntKt = rewriter.create<LLVM::MulOp>(loc, nt, nKt);
 
-    // kt loop: carry (kt, accF32 : <32xf32>) -- one f32 accumulator per row.
+    // kt loop: carry (kt, accSfBits : <32xi32>) -- one f32 accumulator per row,
+    // represented as sf/qf32 HVX intrinsic bits to avoid generic vector f32 ops.
     Block *ktHeader =
-        rewriter.createBlock(contBlock, {i32Ty, v32f32}, {loc, loc});
+        rewriter.createBlock(contBlock, {i32Ty, v32i32}, {loc, loc});
     Block *ktBody = rewriter.createBlock(contBlock);
-    Block *ktExit = rewriter.createBlock(contBlock, {v32f32}, {loc});
+    Block *ktExit = rewriter.createBlock(contBlock, {v32i32}, {loc});
     rewriter.setInsertionPointToEnd(ntBody);
-    Value zeroFV = rewriter.create<LLVM::ZeroOp>(loc, v32f32);
-    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0, zeroFV}, ktHeader);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0, zeroI32V}, ktHeader);
 
     rewriter.setInsertionPointToEnd(ktHeader);
     Value kt = ktHeader->getArgument(0);
-    Value accFV = ktHeader->getArgument(1);
+    Value accSfBits = ktHeader->getArgument(1);
     Value ktCond =
         rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, kt, nKt);
     rewriter.create<LLVM::CondBrOp>(loc, ktCond, ktBody, ValueRange{}, ktExit,
-                                    ValueRange{accFV});
+                                    ValueRange{accSfBits});
 
     // kt body: vectorized int dot of all 32 rows of tile (nt,kt) over 32 K, then
-    // scale (per-row wt scale * scalar act scale) and accumulate into accFV.
+    // scale (per-row wt scale * scalar act scale) and accumulate into accSfBits.
     rewriter.setInsertionPointToEnd(ktBody);
     // tile (nt,kt): src byte off = (ntKt + kt)*1152. sv at +0, qz at +128.
     Value tileIdx = rewriter.create<LLVM::AddOp>(loc, ntKt, kt);
@@ -1432,35 +1434,33 @@ struct LowerMatmulVrmpyCrouton
       Value aVec = bcastActWord(awPtr);
       iacc = call1(vrmpyAccFn, v32i32, ValueRange{iacc, wVec, aVec});
     }
-    // int32 -> f32 (per-row dot for this kt block).
-    Value iaccF = rewriter.create<LLVM::SIToFPOp>(loc, v32f32, iacc);
-    // Per-row wt scale: load the 128B dup-scale (sv, <64xf16>); the 32 distinct
-    // row scales are sv[r*2] = even fp16 lanes -> <32xf16> -> <32xf32>.
-    Value svVec =
-        rewriter.create<LLVM::LoadOp>(loc, v64f16, tileBase, /*align=*/2)
+    // int32 -> sf bits (per-row dot for this kt block).
+    Value iaccSf = call1(convSfWFn, v32i32, ValueRange{iacc});
+    // Per-row wt scale: crouton stores a 128B dup-scale vector
+    // [s0,s0,s1,s1,...,s31,s31]. Load it directly as the packed fp16 operand
+    // expected by vmpy.qf32.hf.
+    Value wsHf =
+        rewriter.create<LLVM::LoadOp>(loc, v32i32, tileBase, /*align=*/2)
             .getResult();
-    SmallVector<int32_t, 32> evenMask(32);
-    for (int r = 0; r < 32; r++) evenMask[r] = r * 2;
-    Value svEven = rewriter.create<LLVM::ShuffleVectorOp>(
-        loc, svVec, svVec, evenMask);
-    Value wsFV = rewriter.create<LLVM::FPExtOp>(loc, v32f32, svEven);
-    // Scalar act scale (fp16 at actScaleBase + kt*2) broadcast to <32xf32>.
+    // Scalar act scale (fp16 at actScaleBase + kt*2), packed and broadcast to
+    // all fp16 lanes as the second qf16/hf multiplier.
     Value asOff = rewriter.create<LLVM::MulOp>(loc, kt, c2);
     Value asPtr = gepI8(actScaleBase, asOff);
-    Value asHalf = rewriter.create<LLVM::LoadOp>(loc, f16Ty, asPtr, /*align=*/2)
+    Value as16 = rewriter.create<LLVM::LoadOp>(loc, i16Ty, asPtr, /*align=*/2)
                        .getResult();
-    Value asF = rewriter.create<LLVM::FPExtOp>(loc, f32Ty, asHalf);
-    Value asUndef = rewriter.create<LLVM::UndefOp>(loc, v32f32);
-    Value asIns = rewriter.create<LLVM::InsertElementOp>(loc, asUndef, asF, c0);
-    SmallVector<int32_t, 32> bcast32(32, 0);
-    Value asFV = rewriter.create<LLVM::ShuffleVectorOp>(loc, asIns, asUndef,
-                                                        bcast32);
-    // contrib = iaccF * (wsFV * asFV); accNext = accFV + contrib.
-    Value ddFV = rewriter.create<LLVM::FMulOp>(loc, wsFV, asFV);
-    Value contribFV = rewriter.create<LLVM::FMulOp>(loc, iaccF, ddFV);
-    Value accNextFV = rewriter.create<LLVM::FAddOp>(loc, accFV, contribFV);
+    Value as32 = rewriter.create<LLVM::ZExtOp>(loc, i32Ty, as16);
+    Value asHi = rewriter.create<LLVM::ShlOp>(loc, as32, cst(16));
+    Value asPacked = rewriter.create<LLVM::OrOp>(loc, as32, asHi);
+    Value asHf = call1(splatFn, v32i32, ValueRange{asPacked});
+    // contrib = iaccSf * (wsHf * asHf); accNext = accSfBits + contrib.
+    Value ddPair = call1(mpyQf32HfFn, v64i32, ValueRange{wsHf, asHf});
+    Value ddLo = call1(loFn, v32i32, ValueRange{ddPair});
+    Value ddSf = call1(convSfQf32Fn, v32i32, ValueRange{ddLo});
+    Value contrib = call1(mpyQf32SfFn, v32i32, ValueRange{iaccSf, ddSf});
+    Value accQf = call1(addQf32MixFn, v32i32, ValueRange{contrib, accSfBits});
+    Value accNextSf = call1(convSfQf32Fn, v32i32, ValueRange{accQf});
     Value ktNext = rewriter.create<LLVM::AddOp>(loc, kt, c1);
-    rewriter.create<LLVM::BrOp>(loc, ValueRange{ktNext, accNextFV}, ktHeader);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{ktNext, accNextSf}, ktHeader);
 
     // kt exit: store the 32 f32 outputs for rows nt*32 .. nt*32+31.
     rewriter.setInsertionPointToEnd(ktExit);
@@ -1468,7 +1468,9 @@ struct LowerMatmulVrmpyCrouton
     Value outRowIdx = rewriter.create<LLVM::AddOp>(loc, mOutElt, rowBase);
     Value outRowPtr = rewriter.create<LLVM::GEPOp>(loc, ptrTy, f32Ty, outPtr,
                                                    ValueRange{outRowIdx});
-    rewriter.create<LLVM::StoreOp>(loc, ktExit->getArgument(0), outRowPtr,
+    Value outVec = rewriter.create<LLVM::BitcastOp>(
+        loc, VectorType::get({32}, f32Ty), ktExit->getArgument(0));
+    rewriter.create<LLVM::StoreOp>(loc, outVec, outRowPtr,
                                    /*align=*/4);
     Value ntNext = rewriter.create<LLVM::AddOp>(loc, nt, c1);
     rewriter.create<LLVM::BrOp>(loc, ValueRange{ntNext}, ntHeader);
