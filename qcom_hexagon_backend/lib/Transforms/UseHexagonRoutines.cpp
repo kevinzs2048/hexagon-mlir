@@ -76,6 +76,8 @@ static FailureOr<std::string> LLVMOpToHexagonRountineName(const Operation *op) {
           [](auto ty) { return FailureOr<std::string>(std::string("exp")); })
       .Case<LLVM::Exp2Op>(
           [](auto ty) { return FailureOr<std::string>(std::string("pow")); })
+      .Case<LLVM::LogOp>(
+          [](auto ty) { return FailureOr<std::string>(std::string("log")); })
       .Case<LLVM::SinOp>(
           [](auto ty) { return FailureOr<std::string>(std::string("sin")); })
       .Case<LLVM::CosOp>(
@@ -432,6 +434,7 @@ void populateEnableHexagonRoutinesPattern(RewritePatternSet &patterns) {
   // Add patterns to convert intrinsics to Hexagon runtime calls
   patterns.insert<NativeVectorFloatOps<LLVM::ExpOp>>(patterns.getContext());
   patterns.insert<NativeVectorFloatOps<LLVM::Exp2Op>>(patterns.getContext());
+  patterns.insert<NativeVectorFloatOps<LLVM::LogOp>>(patterns.getContext());
   patterns.insert<NativeVectorFloatOps<LLVM::SinOp>>(patterns.getContext());
   patterns.insert<NativeVectorFloatOps<LLVM::ASinOp>>(patterns.getContext());
   patterns.insert<NativeVectorFloatOps<LLVM::CosOp>>(patterns.getContext());

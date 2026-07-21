@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
+from triton.language.extra import libdevice
 from .. import parameterize_func_name
 
 triton.runtime.driver.set_active(HexagonDriver())
@@ -34,6 +35,22 @@ def sin_kernel(x_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
     offsets = tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offsets)
     output = tl.sin(x)
+    tl.store(output_ptr + offsets, output)
+
+
+@triton.jit
+def exp_kernel(x_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    output = tl.exp(x)
+    tl.store(output_ptr + offsets, output)
+
+
+@triton.jit
+def tanh_kernel(x_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    output = libdevice.tanh(x)
     tl.store(output_ptr + offsets, output)
 
 
@@ -66,3 +83,34 @@ def test_math_ops():
 
     reference = torch.sin(X)
     assert torch.allclose(Y, reference, atol=ATOL)
+
+
+def test_exp_tanh_ops():
+    X = torch.linspace(-3.0, 3.0, N, dtype=torch.float32)
+    Y = torch.empty_like(X)
+
+    exp_kernel[(1,)](
+        X,
+        Y,
+        BLOCK_SIZE=1024,
+        enableMultiThreading=True,
+        enableVTCMTiling=True,
+        enableConvertToHexagonmem=True,
+        enableHexagonmemCopyToDMA=True,
+    )
+
+    reference = torch.exp(X)
+    assert torch.allclose(Y, reference, atol=1e-2)
+
+    tanh_kernel[(1,)](
+        X,
+        Y,
+        BLOCK_SIZE=1024,
+        enableMultiThreading=True,
+        enableVTCMTiling=True,
+        enableConvertToHexagonmem=True,
+        enableHexagonmemCopyToDMA=True,
+    )
+
+    reference = torch.tanh(X)
+    assert torch.allclose(Y, reference, atol=1e-2)
