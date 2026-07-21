@@ -16,14 +16,10 @@
 
 #include <atomic>
 #include <cassert>
-#include <condition_variable>
-#include <functional>
-#include <iostream>
-#include <mutex>
-#include <thread>
+#include <cstddef>
+#include <new>
 #include <vector>
 
-#include "HexagonThreadPool.h"
 #include "llvm/ADT/StringMap.h"
 
 using namespace mlir::runtime;
@@ -49,7 +45,6 @@ public:
   AsyncRuntime() : numRefCountedObjects(0) {}
 
   ~AsyncRuntime() {
-    threadPool.wait(); // wait for the completion of all async tasks
     assert(getNumRefCountedObjects() == 0 &&
            "all ref counted objects must be destroyed");
   }
@@ -57,8 +52,6 @@ public:
   int64_t getNumRefCountedObjects() {
     return numRefCountedObjects.load(std::memory_order_relaxed);
   }
-
-  HexagonThreadPool &getThreadPool() { return threadPool; }
 
 private:
   friend class RefCounted;
@@ -73,7 +66,6 @@ private:
   }
 
   std::atomic<int64_t> numRefCountedObjects;
-  HexagonThreadPool threadPool;
 };
 
 // -------------------------------------------------------------------------- //
@@ -155,17 +147,14 @@ private:
 } // namespace
 
 // Returns the default per-process instance of an async runtime.
-static std::unique_ptr<AsyncRuntime> &getDefaultAsyncRuntimeInstance() {
-  static auto runtime = std::make_unique<AsyncRuntime>();
-  return runtime;
-}
-
-static void resetDefaultAsyncRuntime() {
-  return getDefaultAsyncRuntimeInstance().reset();
-}
-
 static AsyncRuntime *getDefaultAsyncRuntime() {
-  return getDefaultAsyncRuntimeInstance().get();
+  alignas(AsyncRuntime) static unsigned char storage[sizeof(AsyncRuntime)];
+  static bool initialized = false;
+  if (!initialized) {
+    new (storage) AsyncRuntime();
+    initialized = true;
+  }
+  return reinterpret_cast<AsyncRuntime *>(storage);
 }
 
 // Async token provides a mechanism to signal asynchronous operation completion.
@@ -180,10 +169,6 @@ struct AsyncToken : public RefCounted {
 
   std::atomic<State::StateEnum> state;
 
-  // Pending awaiters are guarded by a mutex.
-  std::mutex mu;
-  std::condition_variable cv;
-  std::vector<std::function<void()>> awaiters;
 };
 
 // Async value provides a mechanism to access the result of asynchronous
@@ -200,10 +185,6 @@ struct AsyncValue : public RefCounted {
   // Use vector of bytes to store async value payload.
   std::vector<std::byte> storage;
 
-  // Pending awaiters are guarded by a mutex.
-  std::mutex mu;
-  std::condition_variable cv;
-  std::vector<std::function<void()>> awaiters;
 };
 
 // Async group provides a mechanism to group together multiple async tokens or
@@ -217,10 +198,6 @@ struct AsyncGroup : public RefCounted {
   std::atomic<int> numErrors;
   std::atomic<int> rank;
 
-  // Pending awaiters are guarded by a mutex.
-  std::mutex mu;
-  std::condition_variable cv;
-  std::vector<std::function<void()>> awaiters;
 };
 
 // Adds references to reference counted runtime object.
@@ -255,48 +232,15 @@ extern "C" AsyncGroup *mlirAsyncRuntimeCreateGroup(int64_t size) {
 
 extern "C" int64_t mlirAsyncRuntimeAddTokenToGroup(AsyncToken *token,
                                                    AsyncGroup *group) {
-  std::unique_lock<std::mutex> lockToken(token->mu);
-  std::unique_lock<std::mutex> lockGroup(group->mu);
-
   // Get the rank of the token inside the group before we drop the reference.
   int rank = group->rank.fetch_add(1);
 
-  auto onTokenReady = [group, token]() {
-    // Increment the number of errors in the group.
-    if (State(token->state).isError())
-      group->numErrors.fetch_add(1);
+  mlirAsyncRuntimeAwaitToken(token);
+  if (State(token->state).isError())
+    group->numErrors.fetch_add(1);
 
-    // If pending tokens go below zero it means that more tokens than the group
-    // size were added to this group.
-    assert(group->pendingTokens > 0 && "wrong group size");
-
-    // Run all group awaiters if it was the last token in the group.
-    if (group->pendingTokens.fetch_sub(1) == 1) {
-      group->cv.notify_all();
-      for (auto &awaiter : group->awaiters)
-        awaiter();
-    }
-  };
-
-  if (State(token->state).isAvailableOrError()) {
-    // Update group pending tokens immediately and maybe run awaiters.
-    onTokenReady();
-
-  } else {
-    // Update group pending tokens when token will become ready. Because this
-    // will happen asynchronously we must ensure that `group` is alive until
-    // then, and re-ackquire the lock.
-    group->addRef();
-
-    token->awaiters.emplace_back([group, onTokenReady]() {
-      // Make sure that `dropRef` does not destroy the mutex owned by the lock.
-      {
-        std::unique_lock<std::mutex> lockGroup(group->mu);
-        onTokenReady();
-      }
-      group->dropRef();
-    });
-  }
+  assert(group->pendingTokens > 0 && "wrong group size");
+  group->pendingTokens.fetch_sub(1);
 
   return rank;
 }
@@ -307,14 +251,7 @@ static void setTokenState(AsyncToken *token, State state) {
   assert(state.isAvailableOrError() && "must be terminal state");
   assert(State(token->state).isUnavailable() && "token must be unavailable");
 
-  // Make sure that `dropRef` does not destroy the mutex owned by the lock.
-  {
-    std::unique_lock<std::mutex> lock(token->mu);
-    token->state = state;
-    token->cv.notify_all();
-    for (auto &awaiter : token->awaiters)
-      awaiter();
-  }
+  token->state = state;
 
   // Async tokens created with a ref count `2` to keep token alive until the
   // async task completes. Drop this reference explicitly when token emplaced.
@@ -325,14 +262,7 @@ static void setValueState(AsyncValue *value, State state) {
   assert(state.isAvailableOrError() && "must be terminal state");
   assert(State(value->state).isUnavailable() && "value must be unavailable");
 
-  // Make sure that `dropRef` does not destroy the mutex owned by the lock.
-  {
-    std::unique_lock<std::mutex> lock(value->mu);
-    value->state = state;
-    value->cv.notify_all();
-    for (auto &awaiter : value->awaiters)
-      awaiter();
-  }
+  value->state = state;
 
   // Async values created with a ref count `2` to keep value alive until the
   // async task completes. Drop this reference explicitly when value emplaced.
@@ -368,23 +298,18 @@ extern "C" bool mlirAsyncRuntimeIsGroupError(AsyncGroup *group) {
 }
 
 extern "C" void mlirAsyncRuntimeAwaitToken(AsyncToken *token) {
-  std::unique_lock<std::mutex> lock(token->mu);
-  if (!State(token->state).isAvailableOrError())
-    token->cv.wait(
-        lock, [token] { return State(token->state).isAvailableOrError(); });
+  while (!State(token->state).isAvailableOrError()) {
+  }
 }
 
 extern "C" void mlirAsyncRuntimeAwaitValue(AsyncValue *value) {
-  std::unique_lock<std::mutex> lock(value->mu);
-  if (!State(value->state).isAvailableOrError())
-    value->cv.wait(
-        lock, [value] { return State(value->state).isAvailableOrError(); });
+  while (!State(value->state).isAvailableOrError()) {
+  }
 }
 
 extern "C" void mlirAsyncRuntimeAwaitAllInGroup(AsyncGroup *group) {
-  std::unique_lock<std::mutex> lock(group->mu);
-  if (group->pendingTokens != 0)
-    group->cv.wait(lock, [group] { return group->pendingTokens == 0; });
+  while (group->pendingTokens != 0) {
+  }
 }
 
 // Returns a pointer to the storage owned by the async value.
@@ -394,51 +319,32 @@ extern "C" ValueStorage mlirAsyncRuntimeGetValueStorage(AsyncValue *value) {
 }
 
 extern "C" void mlirAsyncRuntimeExecute(CoroHandle handle, CoroResume resume) {
-  auto *runtime = getDefaultAsyncRuntime();
-  runtime->getThreadPool().async([handle, resume]() { (*resume)(handle); });
+  (*resume)(handle);
 }
 
 extern "C" void mlirAsyncRuntimeAwaitTokenAndExecute(AsyncToken *token,
                                                      CoroHandle handle,
                                                      CoroResume resume) {
-  auto execute = [handle, resume]() { (*resume)(handle); };
-  std::unique_lock<std::mutex> lock(token->mu);
-  if (State(token->state).isAvailableOrError()) {
-    lock.unlock();
-    execute();
-  } else {
-    token->awaiters.emplace_back([execute]() { execute(); });
-  }
+  mlirAsyncRuntimeAwaitToken(token);
+  (*resume)(handle);
 }
 
 extern "C" void mlirAsyncRuntimeAwaitValueAndExecute(AsyncValue *value,
                                                      CoroHandle handle,
                                                      CoroResume resume) {
-  auto execute = [handle, resume]() { (*resume)(handle); };
-  std::unique_lock<std::mutex> lock(value->mu);
-  if (State(value->state).isAvailableOrError()) {
-    lock.unlock();
-    execute();
-  } else {
-    value->awaiters.emplace_back([execute]() { execute(); });
-  }
+  mlirAsyncRuntimeAwaitValue(value);
+  (*resume)(handle);
 }
 
 extern "C" void mlirAsyncRuntimeAwaitAllInGroupAndExecute(AsyncGroup *group,
                                                           CoroHandle handle,
                                                           CoroResume resume) {
-  auto execute = [handle, resume]() { (*resume)(handle); };
-  std::unique_lock<std::mutex> lock(group->mu);
-  if (group->pendingTokens == 0) {
-    lock.unlock();
-    execute();
-  } else {
-    group->awaiters.emplace_back([execute]() { execute(); });
-  }
+  mlirAsyncRuntimeAwaitAllInGroup(group);
+  (*resume)(handle);
 }
 
 extern "C" int64_t mlirAsyncRuntimGetNumWorkerThreads() {
-  return getDefaultAsyncRuntime()->getThreadPool().getMaxConcurrency();
+  return 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -446,9 +352,6 @@ extern "C" int64_t mlirAsyncRuntimGetNumWorkerThreads() {
 //===----------------------------------------------------------------------===//
 
 extern "C" void mlirAsyncRuntimePrintCurrentThreadId() {
-  [[maybe_unused]] static thread_local std::thread::id thisId =
-      std::this_thread::get_id();
-  // std::cout << "Current thread id: " << thisId << '\n';
 }
 
 //===----------------------------------------------------------------------===//
@@ -521,7 +424,6 @@ void __mlir_execution_engine_init(llvm::StringMap<void *> &exportSymbols) {
 
 // NOLINTNEXTLINE(*-identifier-naming): externally called.
 extern "C" MLIR_ASYNC_RUNTIME_EXPORT void __mlir_execution_engine_destroy() {
-  resetDefaultAsyncRuntime();
 }
 
 } // namespace runtime

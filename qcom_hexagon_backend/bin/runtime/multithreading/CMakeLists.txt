@@ -69,7 +69,6 @@ include_directories(
 # Source files
 set(SOURCES
     AsyncRuntime.cpp
-    HexagonThreadPool.cpp
     HexagonCustomDefs.cpp
     StringMap.cpp
     MemAlloc.cpp

@@ -23,7 +23,9 @@
 #define HEXAGONBACKEND_BIN_RUNTIME_USERDMA_RING_BUFFER_H
 
 #include <cassert>
-#include <functional>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace hexagon {
 namespace userdma {
@@ -38,8 +40,7 @@ private:
 
   const uint32_t capacity = 0; // Size of the ring buffer in number of Ts
 
-  std::function<bool(T *)>
-      inFlight; // Function that determines whether a T is in flight
+  InFlightFn inFlight; // Function that determines whether a T is in flight
 
   uint32_t tail = 0; // next allocation index
   uint32_t head = 0; // next free index

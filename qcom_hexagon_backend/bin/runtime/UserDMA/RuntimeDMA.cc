@@ -24,14 +24,20 @@
 
 #include "RuntimeDMA.h"
 #include "UserDMA.h"
+#include <new>
 
 namespace hexagon {
 namespace userdma {
 
-// Create a static object of HexagonUserDMA to be used in DMAStart and
-// DMAWait APIs. TODO: Make HexagonUserDMA class as a singleton and
-// call its static member function to get its unique instance
-static UserDMA hexDMA(hexagon::userdma::MAX_NUM_DMA_DESCRIPTORS);
+static UserDMA &getHexDMA() {
+  alignas(UserDMA) static unsigned char storage[sizeof(UserDMA)];
+  static bool initialized = false;
+  if (!initialized) {
+    new (storage) UserDMA(hexagon::userdma::MAX_NUM_DMA_DESCRIPTORS);
+    initialized = true;
+  }
+  return *reinterpret_cast<UserDMA *>(storage);
+}
 
 /*!
  * Initiate DMA to copy memory from source to destination address
@@ -48,8 +54,8 @@ extern "C" uint32_t
 hexagon_runtime_dma_start(void *src, AddrSpace srcAS, void *dst,
                           AddrSpace dstAS, uint32_t length, bool bypassCacheSrc,
                           bool bypassCacheDst, DMAStatus *status) {
-  return hexDMA.copy(src, srcAS, dst, dstAS, length, bypassCacheSrc,
-                     bypassCacheDst, status);
+  return getHexDMA().copy(src, srcAS, dst, dstAS, length, bypassCacheSrc,
+                          bypassCacheDst, status);
 }
 
 /*!
@@ -81,11 +87,11 @@ hexagon_runtime_dma_start(void *src, AddrSpace srcAS, void *dst,
 extern "C" uint32_t hexagon_runtime_dma2d_start(
     void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS, uint32_t width,
     uint32_t height, uint32_t srcStride, uint32_t dstStride,
-    bool bypassCacheSrc, bool bypassCacheDst, bool isOrdered,
-    uint32_t cacheAllocationPolicy, DMAStatus *status) {
-  return hexDMA.copy2D(src, srcAS, dst, dstAS, width, height, srcStride,
-                       dstStride, bypassCacheSrc, bypassCacheDst, isOrdered,
-                       cacheAllocationPolicy, status);
+                       bool bypassCacheSrc, bool bypassCacheDst, bool isOrdered,
+                       uint32_t cacheAllocationPolicy, DMAStatus *status) {
+  return getHexDMA().copy2D(src, srcAS, dst, dstAS, width, height, srcStride,
+                            dstStride, bypassCacheSrc, bypassCacheDst,
+                            isOrdered, cacheAllocationPolicy, status);
 }
 
 /*!
@@ -93,7 +99,9 @@ extern "C" uint32_t hexagon_runtime_dma2d_start(
  * complete
  * token: token corresponding to the DMA transfer to wait
  */
-extern "C" void hexagon_runtime_dma_wait(uint32_t token) { hexDMA.wait(token); }
+extern "C" void hexagon_runtime_dma_wait(uint32_t token) {
+  getHexDMA().wait(token);
+}
 
 } // namespace userdma
 } // namespace hexagon

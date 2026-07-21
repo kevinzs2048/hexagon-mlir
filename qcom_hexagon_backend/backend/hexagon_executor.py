@@ -111,6 +111,27 @@ class HexagonExecutor:
         Q6_VERSION = env["Q6_VERSION"]
         return config(env_vars=env, HEX_TOOLS=HEX_TOOLS, Q6_VERSION=Q6_VERSION)
 
+    def object_references_symbol_prefix(self, object_path: str, prefix: str) -> bool:
+        llvm_nm = shutil.which("llvm-nm")
+        if llvm_nm is None:
+            llvm_syspath = os.environ.get("LLVM_SYSPATH", "")
+            candidate = os.path.join(llvm_syspath, "bin", "llvm-nm")
+            if os.path.exists(candidate):
+                llvm_nm = candidate
+        if llvm_nm is None:
+            return True
+        try:
+            result = subprocess.run(
+                [llvm_nm, "-u", object_path],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return True
+        return any(prefix in line for line in result.stdout.splitlines())
+
     '''
         Executing the shared objects on the device or simulator (depending on the env var RUN_ON_SIM).
 
@@ -248,18 +269,24 @@ class HexagonExecutor:
             LINK_DIRS += f" -L{hexkl_dir}"
             runtime_libs.append("hexkl_micro")
 
-        # Check if HEXAGON_RUNTIME_LIBS_DIR + "/multithreading exists and "libhexagon_mlir_async_runtime.a" inside it
-        multithreading_dir = os.path.join(
-            self.config.env_vars["HEXAGON_RUNTIME_LIBS_DIR"], "multithreading"
-        )
-        if os.path.exists(multithreading_dir) and os.path.exists(
-            os.path.join(multithreading_dir, "libhexagon_mlir_async_runtime.a")
-        ):
-            LINK_DIRS += f" -L{multithreading_dir}"
-            runtime_libs.append("hexagon_mlir_async_runtime")
         runtime_libs_str = " ".join([f"-l{lib}" for lib in runtime_libs])
         print("==> Compiling shared object file ...")
         dir, kernel_file_without_ext, _ = split_path(kernel_obj_path)
+
+        # Link the async runtime only for objects that reference MLIR async
+        # symbols. Pulling it into direct kernels adds pthread startup state on
+        # the DSP and can make a no-thread wrapper fail before producing dumps.
+        multithreading_dir = os.path.join(
+            self.config.env_vars["HEXAGON_RUNTIME_LIBS_DIR"], "multithreading"
+        )
+        if self.object_references_symbol_prefix(kernel_obj_path, "mlirAsyncRuntime"):
+            if os.path.exists(multithreading_dir) and os.path.exists(
+                os.path.join(multithreading_dir, "libhexagon_mlir_async_runtime.a")
+            ):
+                LINK_DIRS += f" -L{multithreading_dir}"
+                runtime_libs.append("hexagon_mlir_async_runtime")
+                runtime_libs_str = " ".join([f"-l{lib}" for lib in runtime_libs])
+
         so_name = "libTriton" if htp_kernel_gen else "lib" + kernel_file_without_ext
         kernel_path = os.path.join(dir, f"{so_name}.so")
         # If the shared object we're generating needs to be linked with some dependencies, extract the base directory

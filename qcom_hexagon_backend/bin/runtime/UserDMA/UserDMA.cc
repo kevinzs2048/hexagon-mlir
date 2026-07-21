@@ -121,7 +121,7 @@ uint32_t UserDMA::copy2D(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
   dmaDesc = dmaQueue->alloc(token);
   // This transfer is not ordered wrt earlier transfers;
   // DMA Done bit cleared; No read/write cache allocation policy
-  std::memset(dmaDesc, 0, sizeof(DMADesc2D));
+  memset(dmaDesc, 0, sizeof(DMADesc2D));
 
   // populate descriptor fields
   dmaDescSetState(dmaDesc, DESC_STATE_READY);
