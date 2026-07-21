@@ -185,7 +185,7 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
             function_arg_string = self.generate_llvm_function_signature_arg_string()
         else:
             function_arg_string = self.generate_llvm_direct_returns_function_signature()
-        # Represents the num_programs(x,y,z) and program_id(x,y,z) arguments
+        # Represents the num_programs(x,y,z) and program_id(x,y,z) arguments.
         function_arg_string += ", int, int, int, int, int, int"
         return self.common_strings.extern_llvm_func_defn.format(
             kernel_name=self.func_name, function_arg_string=function_arg_string
@@ -214,7 +214,8 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
             function_call_descriptor_string = (
                 self.generate_llvm_direct_returns_function_call_arg_string()
             )
-        # Since this is used for the single threaded case only, the num_programs is (1,1,1) and program_ids is (0,0,0).
+        # Since this is used for the single threaded case only, the
+        # num_programs is (1,1,1) and program_ids is (0,0,0).
         function_call_descriptor_string += ", 1, 1, 1, 0, 0, 0"
         return self.common_strings.extern_llvm_func_call.format(
             func_name=self.func_name, descriptor_string=function_call_descriptor_string
