@@ -31,6 +31,7 @@
 
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
+#include "hexagon/Transforms/LinalgUtils.h"
 #include "hexagon/Transforms/OptionsParsing.h"
 #include "hexagon/Transforms/Passes.h"
 
@@ -180,6 +181,9 @@ void FormVirtualThreadsPass::runOnOperation() {
   // access the pass options.
 
   funcOp.walk([&](linalg::GenericOp op) {
+    if (isNoReuseElementwiseGeneric(op))
+      return WalkResult::advance();
+
     IRRewriter rewriter(op.getContext());
     scf::SCFTilingOptions tilingOptions;
 

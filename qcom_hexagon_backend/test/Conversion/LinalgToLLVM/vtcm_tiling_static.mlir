@@ -29,20 +29,44 @@ func.func @static_size_no_tiling(%x: memref<128x256xf32>, %y: memref<128x256xf32
 // CHECK-LABEL: @static_size_no_tiling
 // CHECK-SAME: %[[X:.+]]: memref<128x256xf32>, %[[Y:.+]]: memref<128x256xf32>, %[[Z:.+]]: memref<128x256xf32>
 //
-// CHECK: %[[ALLOC1:.+]] = memref.alloc() {alignment = 64 : i64} : memref<128x256xf32, 1>
-// CHECK-NEXT: memref.copy %[[X]], %[[ALLOC1]] : memref<128x256xf32> to memref<128x256xf32, 1>
-// CHECK: %[[ALLOC2:.+]] = memref.alloc() {alignment = 64 : i64} : memref<128x256xf32, 1>
-// CHECK-NEXT: memref.copy %[[Y]], %[[ALLOC2]] : memref<128x256xf32> to memref<128x256xf32, 1>
-// CHECK: %[[ALLOC3:.+]] = memref.alloc() {alignment = 64 : i64} : memref<128x256xf32, 1>
-// CHECK-NEXT: memref.copy %[[Z]], %[[ALLOC3]] : memref<128x256xf32> to memref<128x256xf32, 1>
-// CHECK: linalg.generic {{.*}} ins(%[[ALLOC1]], %[[ALLOC2]] :  memref<128x256xf32, 1>, memref<128x256xf32, 1>) outs(%[[ALLOC3]] : memref<128x256xf32, 1>)
-// CHECK: %[[ALLOC4:.+]] = memref.alloc() {alignment = 64 : i64} : memref<128x256xf32>
-// CHECK: memref.copy %[[ALLOC3]], %[[ALLOC4]] :  memref<128x256xf32, 1> to memref<128x256xf32>
-// CHECK: memref.dealloc %[[ALLOC1]] : memref<128x256xf32, 1>
-// CHECK: memref.dealloc %[[ALLOC2]] : memref<128x256xf32, 1>
-// CHECK: memref.dealloc %[[ALLOC3]] : memref<128x256xf32, 1>
-// CHECK: memref.dealloc %[[ALLOC4]] : memref<128x256xf32>
+// CHECK-NOT: memref.alloc
+// CHECK-NOT: memref.copy
+// CHECK: linalg.generic {{.*}} ins(%[[X]], %[[Y]] : memref<128x256xf32>, memref<128x256xf32>) outs(%[[Z]] : memref<128x256xf32>)
+// CHECK: return
 //
+
+// -----
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#bcast = affine_map<(d0, d1) -> (d0)>
+module {
+func.func @broadcast_has_reuse_tiling(%x: memref<128xf32>, %y: memref<128x256xf32>, %z: memref<128x256xf32>) {
+   %t0 = bufferization.to_tensor %x restrict writable : memref<128xf32> to tensor<128xf32>
+   %t1 = bufferization.to_tensor %y restrict writable : memref<128x256xf32> to tensor<128x256xf32>
+   %t2 = bufferization.to_tensor %z restrict writable : memref<128x256xf32> to tensor<128x256xf32>
+
+   %t3 = linalg.generic {
+           indexing_maps = [#bcast, #map, #map],
+           iterator_types = ["parallel", "parallel"]}
+           ins(%t0, %t1 : tensor<128xf32>, tensor<128x256xf32>)
+           outs(%t2 : tensor<128x256xf32>) {
+   ^bb0(%in: f32, %in_2: f32, %out: f32):
+
+     %4 = arith.addf %in, %in_2 : f32
+     linalg.yield %4 : f32
+   } -> tensor<128x256xf32>
+
+   bufferization.materialize_in_destination %t3 in writable %z
+      : (tensor<128x256xf32>, memref<128x256xf32>) -> ()
+   return
+ }
+}
+
+// CHECK-LABEL: @broadcast_has_reuse_tiling
+// CHECK: memref.alloc() {alignment = 64 : i64} : memref<128xf32, 1>
+// CHECK: memref.copy
+// CHECK: linalg.generic {{.*}} ins(%{{.*}}, %{{.*}} : memref<128xf32, 1>, memref<128x256xf32, 1>) outs(%{{.*}} : memref<128x256xf32, 1>)
+// CHECK: return
 
 // -----
 

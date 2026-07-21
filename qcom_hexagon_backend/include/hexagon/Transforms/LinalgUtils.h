@@ -28,4 +28,8 @@ llvm::SmallVector<unsigned> getMatmulPermutation(mlir::linalg::LinalgOp op);
 llvm::SmallVector<unsigned>
 getBatchMatmulPermutation(mlir::linalg::LinalgOp op);
 
+/// Return true for pure tensor linalg.generic ops where every input is accessed
+/// with exactly the same projected-permutation map as the single output.
+bool isNoReuseElementwiseGeneric(mlir::linalg::GenericOp genericOp);
+
 #endif

@@ -55,4 +55,5 @@ add_mlir_library(Transforms
   MLIRTransforms
   MLIRMathTransforms
   MLIRSupport
+  HexagonCommon
 )

@@ -43,8 +43,9 @@ class HexagonOptions:
     iterations: int = 10  # Triton specific benchmarking iteration count
 
     # Hexagon Linalg Options
+    puntBuffer: bool = True
     fusion: bool = True
-    fusionAllowRecompute: bool = False
+    fusionAllowRecompute: bool = True
     fusionDoMultiUse: bool = True
 
     enableBufferization: bool = True  # Used to disable for some dma testing

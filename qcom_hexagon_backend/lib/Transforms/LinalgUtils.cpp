@@ -99,3 +99,24 @@ getBatchMatmulPermutation(mlir::linalg::LinalgOp op) {
   // Identity
   return {0, 1, 2, 3};
 }
+
+bool isNoReuseElementwiseGeneric(mlir::linalg::GenericOp genericOp) {
+  if (!genericOp.hasPureTensorSemantics() || !genericOp->getNumResults() ||
+      genericOp.getNumLoops() < 1 || genericOp.getNumDpsInits() != 1)
+    return false;
+
+  for (auto iterType : genericOp.getIteratorTypesArray())
+    if (iterType != utils::IteratorType::parallel)
+      return false;
+
+  auto indexingMaps = genericOp.getIndexingMapsArray();
+  if (!llvm::all_of(indexingMaps,
+                    [](AffineMap map) { return map.isProjectedPermutation(); }))
+    return false;
+
+  AffineMap outMap =
+      genericOp.getMatchingIndexingMap(genericOp.getDpsInitOperand(0));
+  return llvm::all_of(genericOp.getDpsInputOperands(), [&](OpOperand *input) {
+    return genericOp.getMatchingIndexingMap(input) == outMap;
+  });
+}

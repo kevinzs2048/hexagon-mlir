@@ -30,7 +30,7 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
            /*default=*/"true",
            "Attempt to fuse linalg generic ops">,
     Option<"fusionAllowRecompute", "far", "bool",
-           /*default=*/"false",
+           /*default=*/"true",
            "Allow recomputing values when fusing linalg generic ops">,
     Option<"fusionDoMultiUse", "fdmu", "bool",
            /*default=*/"true",
@@ -195,7 +195,7 @@ def HexagonFusion :
   let summary = "Pass to fuse linalg generic ops";
   let options = [
     Option<"fusionAllowRecompute", "far", "bool",
-           /*default=*/"false",
+           /*default=*/"true",
            "Allow recomputing values when fusing linalg generic ops">,
     Option<"fusionDoMultiUse", "fdmu", "bool",
            /*default=*/"true",

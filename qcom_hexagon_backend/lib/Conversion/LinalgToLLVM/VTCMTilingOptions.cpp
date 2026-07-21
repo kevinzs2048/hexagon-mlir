@@ -14,6 +14,7 @@
 #include "hexagon/Conversion/LinalgToLLVM/VTCMTilingOptions.h"
 #include "hexagon/Common/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
+#include "hexagon/Transforms/LinalgUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -312,23 +313,6 @@ SmallVector<unsigned> calculateTileSizeLowerBounds(linalg::LinalgOp op) {
   return lowerBounds;
 }
 
-bool isNoReuseElementwiseGeneric(linalg::LinalgOp op) {
-  auto genericOp = dyn_cast<linalg::GenericOp>(op.getOperation());
-  if (!genericOp)
-    return false;
-
-  if (!genericOp.hasPureTensorSemantics() || !genericOp->getNumResults() ||
-      genericOp.getNumLoops() < 1)
-    return false;
-
-  for (auto iterType : genericOp.getIteratorTypesArray())
-    if (iterType != utils::IteratorType::parallel)
-      return false;
-
-  return llvm::all_of(genericOp.getIndexingMapsArray(), [](AffineMap map) {
-    return map.isProjectedPermutation();
-  });
-}
 } // namespace
 
 namespace mlir {
@@ -505,7 +489,9 @@ getVTCMTilingOptions(linalg::LinalgOp op,
     return failure();
   }
 
-  if (!userProvidedTileSizes && isNoReuseElementwiseGeneric(op)) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op.getOperation());
+  if (!userProvidedTileSizes && genericOp &&
+      isNoReuseElementwiseGeneric(genericOp)) {
     DBG("-> get vtcm tiling options skipped for no-reuse elementwise generic.");
     return failure();
   }
