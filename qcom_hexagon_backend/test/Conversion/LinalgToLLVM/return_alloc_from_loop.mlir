@@ -55,8 +55,8 @@ module attributes {llvm.target_triple = "hexagon"} {
   }
 }
 // CHECK: module attributes {llvm.target_triple = "hexagon"} {
-// CHECK: llvm.func @malloc(i64) -> !llvm.ptr
-// CHECK: llvm.func @memrefCopy(i64, !llvm.ptr, !llvm.ptr)
+// CHECK-DAG: llvm.func @malloc(i64) -> !llvm.ptr
+// CHECK-DAG: llvm.func @memrefCopy(i64, !llvm.ptr, !llvm.ptr)
 // CHECK: llvm.func @kernel(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: i64,
 // CHECK-SAME: %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: i64,
 // CHECK-SAME: %arg6: !llvm.ptr, %arg7: !llvm.ptr, %arg8: i64,

@@ -134,3 +134,63 @@ func.func @add_copy_before_yield_complex_test(%arg0: memref<10xf32>) -> memref<1
 // CHECK:   memref.copy %[[VTCM_BUFFER]], %arg0 : memref<10xf32, 1> to memref<10xf32>
 // CHECK: }
 // CHECK: return %arg0 : memref<10xf32>
+
+// -----
+
+// Test 6: Single-element copies lower to scalar load/store.
+func.func @single_element_copy(
+    %src: memref<1xi32, strided<[1], offset: ?>>,
+    %dst: memref<1xi32, strided<[1], offset: ?>>) {
+  memref.copy %src, %dst : memref<1xi32, strided<[1], offset: ?>> to memref<1xi32, strided<[1], offset: ?>>
+  return
+}
+
+// CHECK-LABEL: @single_element_copy
+// CHECK: %[[C0:.*]] = arith.constant 0 : index
+// CHECK: %[[LOAD:.*]] = memref.load %arg0[%[[C0]]]
+// CHECK: memref.store %[[LOAD]], %arg1[%[[C0]]]
+// CHECK-NOT: memref.copy
+
+// -----
+
+// Test 7: Small stack-backed copies lower to explicit loops.
+func.func @small_stack_copy_to_loops(
+    %dst_base: memref<4x64xf32, strided<[128, 1], offset: ?>>,
+    %rows: index) {
+  %c0 = arith.constant 0 : index
+  %c64 = arith.constant 64 : index
+  %src = memref.alloca() {alignment = 64 : i64} : memref<4x64xf32>
+  %dst = memref.subview %dst_base[0, 0] [%rows, 64] [1, 1]
+    : memref<4x64xf32, strided<[128, 1], offset: ?>> to memref<?x64xf32, strided<[128, 1], offset: ?>>
+  memref.copy %src, %dst : memref<4x64xf32> to memref<?x64xf32, strided<[128, 1], offset: ?>>
+  return
+}
+
+// CHECK-LABEL: @small_stack_copy_to_loops
+// CHECK-DAG: %[[C0:.*]] = arith.constant 0 : index
+// CHECK-DAG: %[[C1:.*]] = arith.constant 1 : index
+// CHECK-DAG: %[[C64:.*]] = arith.constant 64 : index
+// CHECK: %[[SRC:.*]] = memref.alloca()
+// CHECK: %[[DST:.*]] = memref.subview
+// CHECK: scf.for %[[I:.*]] = %[[C0]] to %arg1 step %[[C1]]
+// CHECK:   scf.for %[[J:.*]] = %[[C0]] to %[[C64]] step %[[C1]]
+// CHECK:     %[[VALUE:.*]] = memref.load %[[SRC]][%[[I]], %[[J]]]
+// CHECK:     memref.store %[[VALUE]], %[[DST]][%[[I]], %[[J]]]
+// CHECK-NOT: memref.copy
+
+// -----
+
+// Test 8: Copying a casted view back to the same view is a no-op.
+func.func @cast_view_self_copy(
+    %dst_base: memref<4x64xf32, strided<[128, 1], offset: ?>>,
+    %rows: index) {
+  %dst = memref.subview %dst_base[0, 0] [%rows, 64] [1, 1]
+    : memref<4x64xf32, strided<[128, 1], offset: ?>> to memref<?x64xf32, strided<[128, 1], offset: ?>>
+  %cast = memref.cast %dst
+    : memref<?x64xf32, strided<[128, 1], offset: ?>> to memref<4x64xf32, strided<[128, 1], offset: ?>>
+  memref.copy %cast, %dst : memref<4x64xf32, strided<[128, 1], offset: ?>> to memref<?x64xf32, strided<[128, 1], offset: ?>>
+  return
+}
+
+// CHECK-LABEL: @cast_view_self_copy
+// CHECK-NOT: memref.copy

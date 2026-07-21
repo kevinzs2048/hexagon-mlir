@@ -137,6 +137,19 @@ public:
       return passOption;
     };
 
+    auto isSmallStaticAlloc = [](Value alloc) {
+      auto type = dyn_cast<MemRefType>(alloc.getType());
+      if (!type || !type.hasStaticShape())
+        return false;
+      unsigned elementBitWidth = type.getElementTypeBitWidth();
+      if (!elementBitWidth)
+        return false;
+      uint64_t elementBytes = (static_cast<uint64_t>(elementBitWidth) + 7) / 8;
+      uint64_t allocBytes =
+          static_cast<uint64_t>(type.getNumElements()) * elementBytes;
+      return allocBytes <= 4096;
+    };
+
     auto setLWP = [&](auto passOption) {
       passOption.disableLWPLoop = disableLWPLoop;
       passOption.LWPloopDepth = LWPloopDepth;
@@ -196,10 +209,6 @@ public:
     pm.addPass(createLinalgFoldUnitExtentDimsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
-    if (puntBuffer)
-      pm.addNestedPass<func::FuncOp>(createHexagonPuntBufferPass());
-    pm.addPass(createCanonicalizerPass()); // erase unstrung allocs
-
     // Quantization related passes in this block
     // Lower quant.qcast and quant.dcast ops to arith dialect
     pm.addNestedPass<func::FuncOp>(quant::createLowerQuantOps());
@@ -207,6 +216,9 @@ public:
     pm.addPass(createConvertElementwiseToLinalgPass());
     // Remove quant.scast ops
     pm.addPass(createCSEPass());
+    if (puntBuffer)
+      pm.addNestedPass<func::FuncOp>(createHexagonPuntBufferPass());
+    pm.addPass(createCanonicalizerPass()); // erase unstrung allocs
 
     if (enableHexKL)
       pm.addNestedPass<func::FuncOp>(createMatmulToHexKLPass());
@@ -310,6 +322,9 @@ public:
       passOpts.allowReturnAllocsFromLoops = true;
       pm.addPass(bufferization::createOneShotBufferizePass(passOpts));
       pm.addPass(createCSEPass());
+      pm.addPass(createCanonicalizerPass());
+      pm.addNestedPass<func::FuncOp>(
+          bufferization::createPromoteBuffersToStackPass(isSmallStaticAlloc));
       pm.addPass(createCanonicalizerPass());
 
       if (enableDoubleBuffering) {

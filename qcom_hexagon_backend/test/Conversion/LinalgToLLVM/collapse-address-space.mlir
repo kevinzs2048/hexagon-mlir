@@ -32,8 +32,9 @@ func.func @foo(%x: memref<2048x1024xf32>, %y: memref<2048x1024xf32>, %z: memref<
 // ON: llvm.call @hexagon_runtime_dma_start
 // ON-NOT: builtin.unrealized_conversion_cast
 //
-// OFF: builtin.unrealized_conversion_cast %{{.*}} : !llvm.struct<(ptr, ptr, i64, array<2 x i64>, array<2 x i64>)> to memref<{{.*}}, 1>
-// OFF-NEXT: builtin.unrealized_conversion_cast %{{.*}} : memref<{{.*}}, 1> to !llvm.struct<(ptr<1>, ptr<1>, i64, array<2 x i64>, array<2 x i64>)>
+// OFF-LABEL: llvm.func @hexmem_copy
+// OFF: builtin.unrealized_conversion_cast %{{.*}} : !llvm.struct<(ptr<1>, ptr<1>, i64, array<3 x i64>, array<3 x i64>)> to memref<{{.*}}, 1>
+// OFF-NEXT: builtin.unrealized_conversion_cast %{{.*}} : memref<{{.*}}, 1> to !llvm.struct<(ptr, ptr, i64, array<3 x i64>, array<3 x i64>)>
 
 // -----
 

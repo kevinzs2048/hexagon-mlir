@@ -6,13 +6,13 @@
 // CHECK: %[[SUBVIEW_DST:.*]] = memref.subview %arg1[0, 0, 0] [2, 32, 32] [1, 1, 1]
 // CHECK: %[[DMA_ALLOC1:.*]] = memref.alloc() : memref<1xi32>
 // CHECK: %[[C0:.*]] = arith.constant 0 : index
-// CHECK: %[[C2:.*]] = arith.constant 2 : index
 // CHECK: %[[C1:.*]] = arith.constant 1 : index
+// CHECK: %[[C2:.*]] = arith.constant 2 : index
 // CHECK: scf.for %[[IV1:.*]] = %[[C0]] to %[[C2]] step %[[C1]] {
 // CHECK: %[[C1024:.*]] = arith.constant 1024 : index
 // CHECK: %[[SUB1:.*]] = memref.subview %[[SUBVIEW_SRC]][%[[IV1]], 0, 0] [1, 32, 32] [1, 1, 1] : memref<2x32x32xi8, strided<[4096, 64, 1]>> to memref<1x32x32xi8, strided<[4096, 64, 1], offset: ?>>
-// CHECK: %[[C64:.*]] = arith.constant 64 : index
 // CHECK: %[[C32:.*]] = arith.constant 32 : index
+// CHECK: %[[C64:.*]] = arith.constant 64 : index
 // CHECK: memref.dma_start %[[SUB1]][%[[C0]], %[[C0]], %[[C0]]], %[[TILE]][%[[IV1]], %[[C0]], %[[C0]]], %[[C1024]], %[[DMA_ALLOC1]][%[[C0]]], %[[C64]], %[[C32]] : memref<1x32x32xi8, strided<[4096, 64, 1], offset: ?>>, memref<2x32x32xi8, 1>, memref<1xi32>
 // CHECK: memref.dma_wait %[[DMA_ALLOC1]][%[[C0]]], %[[C1024]] : memref<1xi32>
 // CHECK: }
@@ -21,8 +21,8 @@
 // CHECK: scf.for %[[IV2:.*]] = %[[C0]] to %[[C2]] step %[[C1]] {
 // CHECK: %[[C1024_2:.*]] = arith.constant 1024 : index
 // CHECK: %[[SUB2:.*]] = memref.subview %[[SUBVIEW_DST]][%[[IV2]], 0, 0] [1, 32, 32] [1, 1, 1] : memref<2x32x32xi8, strided<[4096, 64, 1]>> to memref<1x32x32xi8, strided<[4096, 64, 1], offset: ?>> 
-// CHECK: %[[C64:.*]] = arith.constant 64 : index
 // CHECK: %[[C32:.*]] = arith.constant 32 : index
+// CHECK: %[[C64:.*]] = arith.constant 64 : index
 // CHECK: memref.dma_start %[[TILE]][%[[IV2]], %[[C0]], %[[C0]]], %[[SUB2]][%[[C0]], %[[C0]], %[[C0]]], %[[C1024_2]], %[[DMA_ALLOC2]][%[[C0]]], %[[C64]], %[[C32]] : memref<2x32x32xi8, 1>, memref<1x32x32xi8, strided<[4096, 64, 1], offset: ?>>, memref<1xi32>
 // CHECK: memref.dma_wait %[[DMA_ALLOC2]][%[[C0]]], %[[C1024_2]] : memref<1xi32>
 // CHECK: }
@@ -59,13 +59,13 @@ func.func @hexmem_copy_firstTile_3d(
 // CHECK: %[[SUBVIEW_DST:.*]] = memref.subview %arg1[4, 64, 64] [2, 32, 32] [1, 1, 1]
 // CHECK: %[[DMA_ALLOC1:.*]] = memref.alloc() : memref<1xi32>
 // CHECK: %[[C0:.*]] = arith.constant 0 : index
-// CHECK: %[[C2:.*]] = arith.constant 2 : index
 // CHECK: %[[C1:.*]] = arith.constant 1 : index
+// CHECK: %[[C2:.*]] = arith.constant 2 : index
 // CHECK: scf.for %[[IV1:.*]] = %[[C0]] to %[[C2]] step %[[C1]] {
 // CHECK: %[[C1024:.*]] = arith.constant 1024 : index
 // CHECK: %[[SUB1:.*]] = memref.subview %[[SUBVIEW_SRC]][%[[IV1]], 0, 0] [1, 32, 32] [1, 1, 1] : memref<2x32x32xi8, strided<[16384, 128, 1], offset: 73792>> to memref<1x32x32xi8, strided<[16384, 128, 1], offset: ?>>
-// CHECK: %[[C128:.*]] = arith.constant 128 : index
 // CHECK: %[[C32:.*]] = arith.constant 32 : index
+// CHECK: %[[C128:.*]] = arith.constant 128 : index
 // CHECK: memref.dma_start %[[SUB1]][%[[C0]], %[[C0]], %[[C0]]], %[[TILE]][%[[IV1]], %[[C0]], %[[C0]]], %[[C1024]], %[[DMA_ALLOC1]][%[[C0]]], %[[C128]], %[[C32]] :  memref<1x32x32xi8, strided<[16384, 128, 1], offset: ?>>, memref<2x32x32xi8, 1>, memref<1xi32>
 // CHECK: memref.dma_wait %[[DMA_ALLOC1]][%[[C0]]], %[[C1024]] : memref<1xi32>
 // CHECK: }
@@ -74,8 +74,8 @@ func.func @hexmem_copy_firstTile_3d(
 // CHECK: scf.for %[[IV2:.*]] = %[[C0]] to %[[C2]] step %[[C1]] {
 // CHECK: %[[C1024_2:.*]] = arith.constant 1024 : index
 // CHECK: %[[SUB2:.*]] = memref.subview %[[SUBVIEW_DST]][%[[IV2]], 0, 0] [1, 32, 32] [1, 1, 1] : memref<2x32x32xi8, strided<[16384, 128, 1], offset: 73792>> to memref<1x32x32xi8, strided<[16384, 128, 1], offset: ?>> 
-// CHECK: %[[C128:.*]] = arith.constant 128 : index
 // CHECK: %[[C32:.*]] = arith.constant 32 : index
+// CHECK: %[[C128:.*]] = arith.constant 128 : index
 // CHECK: memref.dma_start %[[TILE]][%[[IV2]], %[[C0]], %[[C0]]], %[[SUB2]][%[[C0]], %[[C0]], %[[C0]]], %[[C1024_2]], %[[DMA_ALLOC2]][%[[C0]]], %[[C128]], %[[C32]] : memref<2x32x32xi8, 1>, memref<1x32x32xi8, strided<[16384, 128, 1], offset: ?>>, memref<1xi32>
 // CHECK: memref.dma_wait %[[DMA_ALLOC2]][%[[C0]]], %[[C1024_2]] : memref<1xi32>
 // CHECK: }
@@ -113,15 +113,15 @@ func.func @hexmem_copy_middleTile_3d(
 // CHECK: %[[SUBVIEW_DST:.*]] = memref.subview %arg1[8, 4, 64, 64] [4, 2, 32, 32] [1, 1, 1, 1]
 // CHECK: %[[DMA_ALLOC1:.*]] = memref.alloc() : memref<1xi32>
 // CHECK: %[[C0:.*]] = arith.constant 0 : index
-// CHECK: %[[C4:.*]] = arith.constant 4 : index
 // CHECK: %[[C1:.*]] = arith.constant 1 : index
+// CHECK: %[[C4:.*]] = arith.constant 4 : index
 // CHECK: scf.for %[[IV1:.*]] = %[[C0]] to %[[C4]] step %[[C1]] {
 // CHECK: %[[C2:.*]] = arith.constant 2 : index
 // CHECK: scf.for %[[IV2:.*]] = %[[C0]] to %[[C2]] step %[[C1]] {
 // CHECK: %[[C1024:.*]] = arith.constant 1024 : index
 // CHECK: %[[SUB1:.*]] = memref.subview %[[SUBVIEW_SRC]][%[[IV1]], %[[IV2]], 0, 0] [1, 1, 32, 32] [1, 1, 1, 1]
-// CHECK: %[[C128:.*]] = arith.constant 128 : index
 // CHECK: %[[C32:.*]] = arith.constant 32 : index
+// CHECK: %[[C128:.*]] = arith.constant 128 : index
 // CHECK: memref.dma_start %[[SUB1]][%[[C0]], %[[C0]], %[[C0]], %[[C0]]], %[[TILE]][%[[IV1]], %[[IV2]], %[[C0]], %[[C0]]], %[[C1024]], %[[DMA_ALLOC1]][%[[C0]]], %[[C128]], %[[C32]]
 // CHECK: memref.dma_wait %[[DMA_ALLOC1]][%[[C0]]], %[[C1024]]
 // CHECK: }
@@ -133,8 +133,8 @@ func.func @hexmem_copy_middleTile_3d(
 // CHECK: scf.for %[[IV4:.*]] = %[[C0]] to %[[C2_2]] step %[[C1]] {
 // CHECK: %[[C1024_2:.*]] = arith.constant 1024 : index
 // CHECK: %[[SUB2:.*]] = memref.subview %[[SUBVIEW_DST]][%[[IV3]], %[[IV4]], 0, 0] [1, 1, 32, 32] [1, 1, 1, 1]
-// CHECK: %[[C128:.*]] = arith.constant 128 : index
 // CHECK: %[[C32:.*]] = arith.constant 32 : index
+// CHECK: %[[C128:.*]] = arith.constant 128 : index
 // CHECK: memref.dma_start %[[TILE]][%[[IV3]], %[[IV4]], %[[C0]], %[[C0]]], %[[SUB2]][%[[C0]], %[[C0]], %[[C0]], %[[C0]]], %[[C1024_2]], %[[DMA_ALLOC2]][%[[C0]]], %[[C128]], %[[C32]]
 // CHECK: memref.dma_wait %[[DMA_ALLOC2]][%[[C0]]], %[[C1024_2]]
 // CHECK: }

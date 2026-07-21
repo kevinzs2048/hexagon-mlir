@@ -1,9 +1,8 @@
-// RUN: linalg-hexagon-opt %s -linalg-to-llvm | \
-// RUN: linalg-hexagon-translate -emit=llvmir  | FileCheck %s
+// RUN: linalg-hexagon-opt %s -linalg-to-llvm | FileCheck %s
 
-// This test checks the llvm-ir strictly to ensure that basic 2-D tensor sub is
-// done efficiently no matter how other opts behave.
-// Not all tests have to be this restricted.
+// This test checks that no-reuse elementwise lowering streams directly from
+// input DDR buffers into the destination DDR buffer. It must not stage through
+// VTCM or heap-backed temporary output buffers.
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 module {
@@ -28,17 +27,13 @@ func.func @kernel(%x: memref<1024x256xf32>, %y: memref<1024x256xf32>, %z: memref
    return
  }
 }
-// CHECK-LABEL: @kernel(ptr readnone captures(none) %0, ptr %1, i64 %2,
-// CHECK-SAME:          i64 %3, i64 %4, i64 %5, i64 %6, ptr readnone captures(none) %7, ptr %8,
-// CHECK:      tail call void @hexagon_runtime_copy(ptr [[VTCM_X:%.+]], ptr %1, i32 524288, i1 true, i1 false)
-// CHECK:      tail call void @hexagon_runtime_copy(ptr [[VTCM_Y:%.+]], ptr %8, i32 524288, i1 true, i1 false)
-// CHECK:      {{.*}} = phi
-// CHECK-NEXT: {{.*}} = shl
-// CHECK-NEXT: {{.*}} = trunc
-// CHECK-NEXT: [[GEP_X:%.+]] = getelementptr float, ptr [[VTCM_X]]
-// CHECK-NEXT: [[LOAD_X:%.+]] = load <32 x float>, ptr [[GEP_X]]
-// CHECK-NEXT: [[GEP_Y:%.+]] = getelementptr float, ptr [[VTCM_Y]]
-// CHECK-NEXT: [[LOAD_Y:%.+]] = load <32 x float>, ptr [[GEP_Y]]
-// CHECK-NEXT: [[SUB:%.+]] = fsub {{(fast)?}} <32 x float> [[LOAD_X]], [[LOAD_Y]]
-// CHECK-NEXT: [[GEP_Z:%.+]]  = getelementptr float, ptr
-// CHECK-NEXT: store <32 x float> [[SUB]], ptr [[GEP_Z]]
+// CHECK-LABEL: llvm.func @kernel
+// CHECK-NOT: llvm.call @malloc
+// CHECK-NOT: llvm.call @free
+// CHECK-NOT: llvm.intr.memcpy
+// CHECK-NOT: hexagon_runtime_copy
+// CHECK: llvm.load {{.*}} : !llvm.ptr -> vector<32xf32>
+// CHECK: llvm.load {{.*}} : !llvm.ptr -> vector<32xf32>
+// CHECK: llvm.fsub {{.*}} : vector<32xf32>
+// CHECK: llvm.store {{.*}} : vector<32xf32>, !llvm.ptr
+// CHECK: llvm.return

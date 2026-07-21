@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
+#include "hexagon/Transforms/LinalgUtils.h"
 #include "hexagon/Transforms/Transforms.h"
 
 #define DEBUG_TYPE "hexagon-return-value-optimization"
@@ -111,6 +112,38 @@ void populateCandidate(MaterializeOpTy op, FunctionOpInterface funcOp,
   if (!isViewOf || !funcArg.hasOneUse())
     return;
   candidates.emplace_back(op, castOp, funcArg);
+}
+
+bool hasRVOEmptyTensorDpsInit(Operation *op) {
+  auto genericOp = dyn_cast_or_null<linalg::GenericOp>(op);
+  if (!genericOp)
+    return false;
+  if (!isNoReuseElementwiseGeneric(genericOp))
+    return false;
+
+  return llvm::any_of(genericOp.getDpsInits(), [](Value init) {
+    return init.getDefiningOp<tensor::EmptyOp>();
+  });
+}
+
+void markDirectFuncArgDestinationsRestrict(FunctionOpInterface funcOp) {
+  funcOp.walk([&](MaterializeOpTy op) {
+    if (op.getRestrict())
+      return WalkResult::advance();
+
+    auto destArg = dyn_cast<BlockArgument>(op.getDest());
+    if (!destArg || destArg.getOwner() != &funcOp.getFunctionBody().front() ||
+        !isa<BaseMemRefType>(destArg.getType()))
+      return WalkResult::advance();
+
+    Operation *sourceOp = op.getSource().getDefiningOp();
+    if (!sourceOp || !sourceOp->hasOneUse() ||
+        !hasRVOEmptyTensorDpsInit(sourceOp))
+      return WalkResult::advance();
+
+    op.setRestrict(true);
+    return WalkResult::advance();
+  });
 }
 
 /// Return true if `neededValues` dominate (i.e. are available at)
@@ -228,6 +261,7 @@ void HexagonRVOPass::runOnOperation() {
   CandidatesTy candidates;
 
   replaceAllocsWithEmpty(funcOp, rewriter);
+  markDirectFuncArgDestinationsRestrict(funcOp);
   funcOp.walk([&](MaterializeOpTy op) {
     populateCandidate(op, funcOp, candidates);
     return WalkResult::advance();

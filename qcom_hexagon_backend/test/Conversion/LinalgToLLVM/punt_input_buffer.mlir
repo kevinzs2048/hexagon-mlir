@@ -30,6 +30,79 @@ func.func @direct_copy(
 
 // -----
 
+// CHECK-LABEL: subview_copy(
+// CHECK: %[[ARG0:.*]]: memref<*xf32>,
+func.func @subview_copy(%arg0: memref<*xf32>, %arg1: i32) -> f32 {
+  %c0 = arith.constant 0 : index
+  %c64 = arith.constant 64 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = arith.index_cast %arg1 : i32 to index
+// CHECK: %[[REINTERPRET_CAST:.+]] = memref.reinterpret_cast %[[ARG0]] to offset
+  %reinterpret_cast = memref.reinterpret_cast %arg0 to offset: [%0], sizes: [64], strides: [1] : memref<*xf32> to memref<64xf32, strided<[1], offset: ?>>
+  %alloc = memref.alloc() : memref<64xf32>
+  linalg.fill ins(%cst : f32) outs(%alloc : memref<64xf32>)
+  %subview = memref.subview %reinterpret_cast[%c0] [%c64] [1] : memref<64xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1], offset: ?>>
+  %subview_0 = memref.subview %alloc[%c0] [%c64] [1] : memref<64xf32> to memref<?xf32, strided<[1], offset: ?>>
+// CHECK-NOT: memref.copy
+  memref.copy %subview, %subview_0 : memref<?xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1], offset: ?>>
+// CHECK: %[[SUBVIEW:.+]] = memref.subview %[[REINTERPRET_CAST]]
+// CHECK: bufferization.to_tensor %[[SUBVIEW]] restrict : memref<?xf32, strided<[1], offset: ?>> to tensor<?xf32>
+  %1 = bufferization.to_tensor %alloc restrict writable : memref<64xf32> to tensor<64xf32>
+  %2 = tensor.extract %1[%c0] : tensor<64xf32>
+  return %2 : f32
+}
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+// CHECK-LABEL: subview_copy_with_materialize(
+// CHECK-SAME: %[[ARG0:.*]]: memref<*xf32>, %[[ARG1:.*]]: memref<*xf32>
+func.func @subview_copy_with_materialize(%arg0: memref<*xf32>, %arg1: memref<*xf32>, %arg2: i32, %arg3: i32) {
+  %c64_i32 = arith.constant 64 : i32
+  %c64 = arith.constant 64 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = arith.muli %arg3, %c64_i32 : i32
+  %1 = arith.index_cast %0 : i32 to index
+  %reinterpret_cast = memref.reinterpret_cast %arg0 to offset: [%1], sizes: [64], strides: [1] : memref<*xf32> to memref<64xf32, strided<[1], offset: ?>>
+  %2 = arith.addi %1, %c64 : index
+  %3 = arith.index_cast %arg2 : i32 to index
+  %4 = arith.minsi %2, %3 : index
+  %5 = arith.maxsi %4, %1 : index
+  %6 = arith.subi %5, %1 : index
+  %alloc = memref.alloc() : memref<64xf32>
+  %7 = arith.cmpi slt, %6, %c64 : index
+  scf.if %7 {
+    linalg.fill ins(%cst : f32) outs(%alloc : memref<64xf32>)
+  }
+  %subview = memref.subview %reinterpret_cast[0] [%6] [1] : memref<64xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1], offset: ?>>
+  %subview_0 = memref.subview %alloc[0] [%6] [1] : memref<64xf32> to memref<?xf32, strided<[1]>>
+// CHECK-NOT: memref.copy
+  memref.copy %subview, %subview_0 : memref<?xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1]>>
+  %8 = bufferization.to_tensor %alloc restrict writable : memref<64xf32> to tensor<64xf32>
+// CHECK: %[[IN_TENSOR:.+]] = bufferization.to_tensor %{{.+}} restrict : memref<?xf32
+// CHECK: %[[OUT_CAST:.+]] = memref.reinterpret_cast %[[ARG1]]
+// CHECK: %[[OUT_SUBVIEW:.+]] = memref.subview %[[OUT_CAST]]
+// CHECK: %[[OUT_TENSOR:.+]] = bufferization.to_tensor %[[OUT_SUBVIEW]] restrict writable : memref<?xf32
+// CHECK: %[[GENERIC:.+]] = linalg.generic
+// CHECK-SAME: ins(%[[IN_TENSOR]] : tensor<?xf32>)
+// CHECK-SAME: outs(%[[OUT_TENSOR]] : tensor<?xf32>)
+  %9 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins(%8 : tensor<64xf32>) outs(%8 : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %10 = math.exp %in : f32
+    linalg.yield %10 : f32
+  } -> tensor<64xf32>
+  %reinterpret_cast_1 = memref.reinterpret_cast %arg1 to offset: [%1], sizes: [64], strides: [1] : memref<*xf32> to memref<64xf32, strided<[1], offset: ?>>
+  %extracted_slice = tensor.extract_slice %9[0] [%6] [1] : tensor<64xf32> to tensor<?xf32>
+  %subview_2 = memref.subview %reinterpret_cast_1[0] [%6] [1] : memref<64xf32, strided<[1], offset: ?>> to memref<?xf32, strided<[1], offset: ?>>
+// CHECK: bufferization.materialize_in_destination %[[GENERIC]] in restrict writable %[[OUT_SUBVIEW]]
+// CHECK-NOT: tensor.extract_slice
+  bufferization.materialize_in_destination %extracted_slice in writable %subview_2 : (tensor<?xf32>, memref<?xf32, strided<[1], offset: ?>>) -> ()
+  return
+}
+
+// -----
+
 // CHECK-LABEL: @dont_erase_subview_alloc
 func.func @dont_erase_subview_alloc(
      %arg0: memref<*xf16>, %arg1: i32, %arg2: i32, %arg3: i32, %arg4: i32, %buffer2: memref<32768xi8>) -> f16 {

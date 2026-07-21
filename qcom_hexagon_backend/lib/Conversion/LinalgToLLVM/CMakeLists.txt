@@ -35,4 +35,8 @@ add_mlir_conversion_library(LinalgToLLVM
   MLIRRegisterAllExtensions
 
   Transforms
+  DMAToLLVM
+  HexKLToLLVM
+  HexagonMemToLLVM
+  HexagonCommon
 )

@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -32,6 +33,195 @@ using namespace hexagon;
 #include "hexagon/Transforms/Passes.h.inc"
 
 namespace {
+
+static bool hasSingleStaticElement(Value value) {
+  auto type = dyn_cast<MemRefType>(value.getType());
+  return type && type.hasStaticShape() && type.getNumElements() == 1;
+}
+
+static Value stripMemRefCasts(Value value) {
+  while (auto castOp = value.getDefiningOp<memref::CastOp>())
+    value = castOp.getSource();
+  return value;
+}
+
+static bool isAllocaBacked(Value value) {
+  for (;;) {
+    if (value.getDefiningOp<memref::AllocaOp>())
+      return true;
+
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+      return false;
+
+    if (auto castOp = dyn_cast<memref::CastOp>(defOp)) {
+      value = castOp.getSource();
+      continue;
+    }
+    if (auto subviewOp = dyn_cast<memref::SubViewOp>(defOp)) {
+      value = subviewOp.getSource();
+      continue;
+    }
+    if (auto reinterpretOp = dyn_cast<memref::ReinterpretCastOp>(defOp)) {
+      value = reinterpretOp.getSource();
+      continue;
+    }
+
+    return false;
+  }
+}
+
+static FailureOr<uint64_t> getStaticCopySizeBytes(MemRefType sourceType,
+                                                  MemRefType targetType) {
+  if (sourceType.getRank() != targetType.getRank() ||
+      sourceType.getElementType() != targetType.getElementType())
+    return failure();
+
+  uint64_t elements = 1;
+  for (auto dim : llvm::seq<int64_t>(0, sourceType.getRank())) {
+    int64_t sourceDim = sourceType.getDimSize(dim);
+    int64_t targetDim = targetType.getDimSize(dim);
+    if (!ShapedType::isDynamic(sourceDim) &&
+        !ShapedType::isDynamic(targetDim) && sourceDim != targetDim)
+      return failure();
+
+    int64_t staticDim = ShapedType::isDynamic(sourceDim) ? targetDim : sourceDim;
+    if (ShapedType::isDynamic(staticDim))
+      return failure();
+
+    elements *= static_cast<uint64_t>(staticDim);
+  }
+
+  unsigned elementBitWidth = sourceType.getElementTypeBitWidth();
+  if (!elementBitWidth)
+    return failure();
+
+  uint64_t elementBytes = llvm::divideCeil(elementBitWidth, 8u);
+  return elements * elementBytes;
+}
+
+static SmallVector<Value> createCopyBounds(Location loc, PatternRewriter &rewriter,
+                                           Value source, Value target) {
+  auto sourceType = cast<MemRefType>(source.getType());
+  auto targetType = cast<MemRefType>(target.getType());
+  SmallVector<Value> bounds;
+  bounds.reserve(sourceType.getRank());
+  for (int64_t dim = 0; dim < sourceType.getRank(); ++dim) {
+    int64_t sourceDim = sourceType.getDimSize(dim);
+    int64_t targetDim = targetType.getDimSize(dim);
+    if (ShapedType::isDynamic(sourceDim)) {
+      bounds.push_back(rewriter.create<memref::DimOp>(loc, source, dim));
+      continue;
+    }
+    if (ShapedType::isDynamic(targetDim)) {
+      bounds.push_back(rewriter.create<memref::DimOp>(loc, target, dim));
+      continue;
+    }
+    bounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, sourceDim));
+  }
+  return bounds;
+}
+
+struct EraseSelfCopyPattern final : public OpRewritePattern<memref::CopyOp> {
+  EraseSelfCopyPattern(MLIRContext *ctx) : OpRewritePattern(ctx) {}
+
+  LogicalResult matchAndRewrite(memref::CopyOp op,
+                                PatternRewriter &rewriter) const override {
+    if (stripMemRefCasts(op.getSource()) != stripMemRefCasts(op.getTarget()))
+      return failure();
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct SingleElementCopyToLoadStorePattern final
+    : public OpRewritePattern<memref::CopyOp> {
+  SingleElementCopyToLoadStorePattern(MLIRContext *ctx)
+      : OpRewritePattern(ctx) {}
+
+  LogicalResult matchAndRewrite(memref::CopyOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!hasSingleStaticElement(op.getSource()) ||
+        !hasSingleStaticElement(op.getTarget()))
+      return failure();
+
+    auto sourceType = cast<MemRefType>(op.getSource().getType());
+    auto targetType = cast<MemRefType>(op.getTarget().getType());
+    if (sourceType.getRank() != targetType.getRank())
+      return failure();
+
+    Location loc = op.getLoc();
+    SmallVector<Value> sourceIndices(sourceType.getRank());
+    for (Value &index : sourceIndices)
+      index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+
+    SmallVector<Value> targetIndices(targetType.getRank());
+    for (Value &index : targetIndices)
+      index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+
+    Value loaded =
+        rewriter.create<memref::LoadOp>(loc, op.getSource(), sourceIndices);
+    rewriter.replaceOpWithNewOp<memref::StoreOp>(
+        op, loaded, op.getTarget(), targetIndices);
+    return success();
+  }
+};
+
+struct SmallAllocaCopyToLoopsPattern final
+    : public OpRewritePattern<memref::CopyOp> {
+  SmallAllocaCopyToLoopsPattern(MLIRContext *ctx) : OpRewritePattern(ctx) {}
+
+  LogicalResult matchAndRewrite(memref::CopyOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isAllocaBacked(op.getSource()) && !isAllocaBacked(op.getTarget()))
+      return failure();
+
+    auto sourceType = dyn_cast<MemRefType>(op.getSource().getType());
+    auto targetType = dyn_cast<MemRefType>(op.getTarget().getType());
+    if (!sourceType || !targetType || sourceType.getRank() != targetType.getRank())
+      return failure();
+
+    FailureOr<uint64_t> copyBytes =
+        getStaticCopySizeBytes(sourceType, targetType);
+    if (failed(copyBytes) || *copyBytes > 4096)
+      return failure();
+
+    Location loc = op.getLoc();
+    rewriter.setInsertionPoint(op);
+    Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    SmallVector<Value> bounds =
+        createCopyBounds(loc, rewriter, op.getSource(), op.getTarget());
+    SmallVector<Value> indices;
+    indices.reserve(sourceType.getRank());
+
+    auto emitCopy = [&](PatternRewriter &nestedRewriter) {
+      Value loaded =
+          nestedRewriter.create<memref::LoadOp>(loc, op.getSource(), indices);
+      nestedRewriter.create<memref::StoreOp>(loc, loaded, op.getTarget(),
+                                             indices);
+    };
+
+    auto emitLoops = [&](auto &&emitLoops, unsigned dim) -> void {
+      if (dim == bounds.size()) {
+        emitCopy(rewriter);
+        return;
+      }
+
+      scf::ForOp forOp = rewriter.create<scf::ForOp>(loc, zero, bounds[dim], one);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(forOp.getBody());
+      indices.push_back(forOp.getInductionVar());
+      emitLoops(emitLoops, dim + 1);
+      indices.pop_back();
+    };
+
+    emitLoops(emitLoops, 0);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
 
 /// Pattern to eliminate a single intermediate buffer allocation in copy chains.
 ///
@@ -173,6 +363,9 @@ struct CopyCanonicalizationPass
 
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
+    patterns.add<EraseSelfCopyPattern>(patterns.getContext());
+    patterns.add<SingleElementCopyToLoadStorePattern>(patterns.getContext());
+    patterns.add<SmallAllocaCopyToLoopsPattern>(patterns.getContext());
     patterns.add<IntermediateBufferEliminationPattern>(patterns.getContext());
     patterns.add<AddCopyBeforeYieldPattern>(patterns.getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
