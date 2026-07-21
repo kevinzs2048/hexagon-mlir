@@ -1992,7 +1992,30 @@ struct LowerHvxLayoutWeightQ8
       return success();
     }
 
-    // ---- Outer loop over output tiles t in [0, nOutTiles) ----
+    // Optional tile-range [tile_start, tile_start + tile_count) over the
+    // (N/32)*(K/32) output tiles. Dynamic range operands override attrs.
+    // Destination tiles are chunk-local when the range starts after zero, so
+    // N-chunked callers can size the VTCM wt region to one chunk.
+    Value tStartDyn = adaptor.getTileStartDyn(); // null if absent
+    Value tCountDyn = adaptor.getTileCountDyn();
+    int64_t tileStartAttr = op.getTileStart();
+    int64_t tileCountAttr = op.getTileCount();
+    Value tStart;
+    Value tileEnd;
+    bool dynRange = (tStartDyn != nullptr);
+    if (dynRange) {
+      tStart = tStartDyn;
+      Value isZero = rewriter.create<LLVM::ICmpOp>(
+          loc, LLVM::ICmpPredicate::eq, tCountDyn, c0);
+      Value endIfCount = rewriter.create<LLVM::AddOp>(loc, tStartDyn, tCountDyn);
+      tileEnd = rewriter.create<LLVM::SelectOp>(loc, isZero, nOutTiles,
+                                                endIfCount);
+    } else {
+      tStart = cst(tileStartAttr);
+      tileEnd = tileCountAttr == 0 ? nOutTiles : cst(tileStartAttr + tileCountAttr);
+    }
+
+    // ---- Outer loop over output tiles t in [tileStart, tileEnd) ----
     Block *origBlock = rewriter.getInsertionBlock();
     Block *contBlock =
         rewriter.splitBlock(origBlock, rewriter.getInsertionPoint());
@@ -2001,13 +2024,13 @@ struct LowerHvxLayoutWeightQ8
     Block *tBody = rewriter.createBlock(contBlock);
 
     rewriter.setInsertionPointToEnd(origBlock);
-    rewriter.create<LLVM::BrOp>(loc, ValueRange{c0}, tHeader);
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{tStart}, tHeader);
 
     // t header
     rewriter.setInsertionPointToEnd(tHeader);
     Value t = tHeader->getArgument(0);
     Value tCond = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt,
-                                                t, nOutTiles);
+                                                t, tileEnd);
     rewriter.create<LLVM::CondBrOp>(loc, tCond, tBody, ValueRange{}, contBlock,
                                     ValueRange{});
 
@@ -2029,8 +2052,12 @@ struct LowerHvxLayoutWeightQ8
     Value sb2 = rewriter.create<LLVM::MulOp>(loc, subBlk, c2);
     Value scaleOff0 = rewriter.create<LLVM::AddOp>(loc, K, bi16);
     Value scaleOff = rewriter.create<LLVM::AddOp>(loc, scaleOff0, sb2);
-    // tile_base addr (i32) = ptrtoint(wtBase + t*2048)
-    Value tBytes = rewriter.create<LLVM::MulOp>(loc, t, c2048);
+    // tile_base addr (i32) = ptrtoint(wtBase + local_t*2048)
+    // where local_t = t - tile_start for ranged/chunked calls.
+    Value tLocal = (dynRange || tileStartAttr != 0)
+                       ? rewriter.create<LLVM::SubOp>(loc, t, tStart)
+                       : t;
+    Value tBytes = rewriter.create<LLVM::MulOp>(loc, tLocal, c2048);
     Value tilePtr = gepI8(wtBase, tBytes);
     Value tileAddr = rewriter.create<LLVM::PtrToIntOp>(loc, i32Ty, tilePtr);
     // base global row for this N-tile = ct*32

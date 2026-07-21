@@ -30,6 +30,20 @@ from .hexagon_options import HexagonOptions
 # mypy compiler.py hexagon_executor.py hexagon_launcher_base.py torch_mlir_hexagon_launcher.py triton_hexagon_launcher.py --follow-untyped-imports --check-untyped-defs
 
 
+def _hexagon_tool_path(tool: str) -> Path:
+    tools_root = os.getenv("HEXAGON_TOOLS", "")
+    if not tools_root:
+        raise RuntimeError("HEXAGON_TOOLS is not set.")
+    tool_path = Path(tools_root) / "bin" / tool
+    if not tool_path.exists():
+        raise RuntimeError(f"{tool} not found at {tool_path}")
+    return tool_path
+
+
+def _hexagon_llc_path() -> Path:
+    return _hexagon_tool_path("hexagon-llc")
+
+
 def _get_triton_shared_opt_path() -> str:
     path = os.getenv("TRITON_SHARED_OPT_PATH", "")
     if path == "":
@@ -75,7 +89,41 @@ def ttsharedir_to_llir(mod: str, options, metadata={}):
     return qcom_hexagon_backend.translate_linalg_to_llvmir(mlir_mod, options_map)
 
 
+
 def ttsharedir_to_obj(mod: str, options, metadata={}) -> bytes:
+    if options.enableInlineHMX:
+        llir = ttsharedir_to_llir(mod, options, metadata)
+        llir = re.sub(r" captures\(none\)", "", llir)
+        llir = re.sub(r"icmp samesign ", "icmp ", llir)
+        llir = re.sub(r"\bzext nneg ", "zext ", llir)
+        llir = re.sub(r"\bor disjoint ", "or ", llir)
+        llir = re.sub(
+            r"call void @llvm\.lifetime\.(start|end)\.p0\(ptr ",
+            r"call void @llvm.lifetime.\1.p0(i64 -1, ptr ",
+            llir,
+        )
+        llir = re.sub(
+            r"declare void @llvm\.lifetime\.(start|end)\.p0\(ptr\)",
+            r"declare void @llvm.lifetime.\1.p0(i64 immarg, ptr nocapture)",
+            llir,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ll_path = Path(tmpdir) / f"{metadata['name']}.ll"
+            obj_path = Path(tmpdir) / f"{metadata['name']}.o"
+            ll_path.write_text(llir)
+            subprocess.check_call([
+                str(_hexagon_llc_path()),
+                "-mv73",
+                "-mattr=+hmx,+hmxv73,+hvxv73,+hvx-length128b",
+                "-O3",
+                "-relocation-model=pic",
+                "-filetype=obj",
+                str(ll_path),
+                "-o",
+                str(obj_path),
+            ])
+            return obj_path.read_bytes()
+
     context = ir.context()
     qcom_hexagon_backend.load_dialects(context)
     # Temporary regex substitution to lower tt.scan

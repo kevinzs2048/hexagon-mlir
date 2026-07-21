@@ -384,7 +384,10 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value chunkNtRaw =
         rewriter.create<arith::DivUIOp>(loc, availClamped, kTiles);
     // min(chunkNtRaw, nTiles): never chunk wider than the matrix.
-    Value chunkNt = rewriter.create<arith::MinUIOp>(loc, chunkNtRaw, nTiles);
+    Value maxChunkNt = rewriter.create<arith::ConstantIndexOp>(loc, 8);
+    Value chunkNtCapped =
+        rewriter.create<arith::MinUIOp>(loc, chunkNtRaw, maxChunkNt);
+    Value chunkNt = rewriter.create<arith::MinUIOp>(loc, chunkNtCapped, nTiles);
     // The fp16 (non-Q8) weight layout op does not support a tile range, so it
     // can only run all-resident: force a single chunk (chunk_nt = nTiles). The
     // N-chunking is exercised only on the Q8/CROUTON prefill path.
@@ -393,6 +396,9 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
 
     // wt region is sized for ONE chunk (chunk_nt * kTiles tiles).
     Value chunkNkTiles = rewriter.create<arith::MulIOp>(loc, chunkNt, kTiles);
+    Value maxChunkMt = rewriter.create<arith::ConstantIndexOp>(loc, 2);
+    Value chunkMt = rewriter.create<arith::MinUIOp>(loc, maxChunkMt, mTiles);
+
     Value actBytes = rewriter.create<arith::MulIOp>(loc, mkTiles, idx2048);
     Value wtBytes = rewriter.create<arith::MulIOp>(loc, chunkNkTiles, idx2048);
     Value outBytes = rewriter.create<arith::MulIOp>(loc, mnTiles, idx2048);
@@ -524,12 +530,42 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                   /*tile_start=*/b.getI32IntegerAttr(0),
                   /*tile_count=*/b.getI32IntegerAttr(0),
                   /*tile_start_dyn=*/tsI32, /*tile_count_dyn=*/tcI32);
-              // hmx_core_dot: thisNt columns over full K, output into full-N
-              // region at column offset ntStart (row stride = full nTiles).
-              b.create<hexkl::HmxCoreDotOp>(
-                  loc, vtcm, outOffI32, actOffI32, wtOffI32, biasOffI32,
-                  mTilesI32, thisNtI32, kTilesI32,
-                  /*out_col_stride=*/nTilesI32, /*out_col_off=*/ntStartI32);
+              // hmx_core_dot: thisNt columns over full K. M128+large-N dynamic
+              // Q8 shapes hang on v73 when one HMX dot walks all 4 row tiles
+              // across many N chunks, while the same work split into 2-row
+              // chunks matches the stable M64 path. Weight is laid out once per
+              // N chunk and reused across the M chunks.
+              b.create<scf::ForOp>(
+                  loc, idx0, mTiles, chunkMt, ValueRange{},
+                  [&](OpBuilder &b, Location loc, Value mtStart, ValueRange) {
+                    Value mtRem = b.create<arith::SubIOp>(loc, mTiles, mtStart);
+                    Value thisMt =
+                        b.create<arith::MinUIOp>(loc, chunkMt, mtRem);
+                    Value thisMtI32 =
+                        b.create<arith::IndexCastOp>(loc, i32Ty, thisMt);
+                    Value actTileOff =
+                        b.create<arith::MulIOp>(loc, mtStart, kTiles);
+                    Value actByteOff =
+                        b.create<arith::MulIOp>(loc, actTileOff, idx2048);
+                    Value actByteOffI32 =
+                        b.create<arith::IndexCastOp>(loc, i32Ty, actByteOff);
+                    Value actChunkOffI32 =
+                        b.create<arith::AddIOp>(loc, actOffI32, actByteOffI32);
+                    Value outTileOff =
+                        b.create<arith::MulIOp>(loc, mtStart, nTiles);
+                    Value outByteOff =
+                        b.create<arith::MulIOp>(loc, outTileOff, idx2048);
+                    Value outByteOffI32 =
+                        b.create<arith::IndexCastOp>(loc, i32Ty, outByteOff);
+                    Value outChunkOffI32 =
+                        b.create<arith::AddIOp>(loc, outOffI32, outByteOffI32);
+                    b.create<hexkl::HmxCoreDotOp>(
+                        loc, vtcm, outChunkOffI32, actChunkOffI32, wtOffI32,
+                        biasOffI32, thisMtI32, thisNtI32, kTilesI32,
+                        /*out_col_stride=*/nTilesI32,
+                        /*out_col_off=*/ntStartI32);
+                    b.create<scf::YieldOp>(loc);
+                  });
             } else {
               // Single all-resident chunk (chunkNt==nTiles): legacy ops.
               b.create<hexkl::HvxLayoutWeightOp>(loc, vtcm, wtOffI32, rhs, K, N);
