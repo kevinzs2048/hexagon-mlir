@@ -15,8 +15,10 @@
 #ifndef HEXAGON_CONVERSION_LINALGTOLLVM_LOWERCONSTANTSSEPARATELY_H
 #define HEXAGON_CONVERSION_LINALGTOLLVM_LOWERCONSTANTSSEPARATELY_H
 
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -29,9 +31,6 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Transforms/DialectConversion.h"
-
-#include "mlir/InitAllDialects.h"
-#include "mlir/InitAllExtensions.h"
 
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h" // For divideCeil
@@ -74,13 +73,18 @@ struct LowerConstantsSeparatelyPass
 
   // Maximum size above which a module is considered "full" and a new one will
   // be created (can happen several times, leading to several const-only mods)
-  const int maximumBytesPerSharedObject = 5e8; // 500,000,000 bytes = 0.5 GB
+  static constexpr uint64_t maximumBytesPerSharedObject =
+      500'000'000; // 0.5 GB
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const override {
+    registry.insert<mlir::LLVM::LLVMDialect>();
+  }
 
   // Utility function to compute the memory footprint (in bytes) of a constant
   // tensor op, which will be used to know when to create a new mlir module.
   // If passed an operation that's not a valid constant tensor (containing
   // int or float values) it returns 0.
-  int estimateConstantTensorMemoryFootprint(mlir::LLVM::GlobalOp op) {
+  uint64_t estimateConstantTensorMemoryFootprint(mlir::LLVM::GlobalOp op) {
     // Ensure the global is marked constant
     if (!op.getConstant()) {
       return 0;
@@ -88,11 +92,15 @@ struct LowerConstantsSeparatelyPass
 
     mlir::Type type = op.getType();
     mlir::Type previousType;
-    int64_t totalElements = 1;
+    uint64_t totalElements = 1;
 
     // Unwrap nested LLVM array types to get shape and element type
     while (auto arrayType = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(type)) {
-      totalElements *= arrayType.getNumElements();
+      uint64_t count = arrayType.getNumElements();
+      if (count && totalElements > std::numeric_limits<uint64_t>::max() / count) {
+        return std::numeric_limits<uint64_t>::max();
+      }
+      totalElements *= count;
       previousType = type;
       type = arrayType.getElementType();
       // Break if type doesn't change (safety against infinite loop)
@@ -107,11 +115,12 @@ struct LowerConstantsSeparatelyPass
       return 0;
     }
 
-    int64_t elementBitWidth = type.getIntOrFloatBitWidth();
-    int64_t elementByteSize = llvm::divideCeil(elementBitWidth, 8);
-    int64_t totalSize = totalElements * elementByteSize;
-
-    return totalSize;
+    uint64_t elementBitWidth = type.getIntOrFloatBitWidth();
+    uint64_t elementByteSize = llvm::divideCeil(elementBitWidth, uint64_t{8});
+    if (elementByteSize &&
+        totalElements > std::numeric_limits<uint64_t>::max() / elementByteSize)
+      return std::numeric_limits<uint64_t>::max();
+    return totalElements * elementByteSize;
   }
 
   // Main function of the pass, which goes through the module, looking for
@@ -123,26 +132,18 @@ struct LowerConstantsSeparatelyPass
   void runOnOperation() override {
     mlir::ModuleOp mod = getOperation();
     mlir::MLIRContext &newContext = *(mod.getContext());
-
-    // Create a DialectRegistry and register the necessary extensions
-    mlir::DialectRegistry newRegistry;
-    mlir::registerAllExtensions(newRegistry);
-
-    // Appends the registry to the new context
-    newContext.appendDialectRegistry(newRegistry);
+    producedModules.clear();
 
     // Create a new MLIR module in which we'll be putting the current op
     DBG("[LowerConstantsSeparately] Creating a new module for constants only"
         << "\n");
     mlir::ModuleOp newMod =
         mlir::ModuleOp::create(mlir::UnknownLoc::get(&newContext));
+    newMod->setAttrs(mod->getAttrs());
     // The size of the new module will be the sum of the weights (in bytes) of
     // the constant tensors it contains. It is 0 for now since it's empty.
-    int newModSize = 0;
-
-    // Collection to store the keys of the dense resources needed, which we will
-    // find as we discover the constants definitions in the original module
-    std::vector<std::string> resourceKeys;
+    uint64_t newModSize = 0;
+    bool newModHasConstants = false;
 
     // Walking the original MLIR module, trying to find global constants to move
     // to the new MLIR module we just made
@@ -162,10 +163,14 @@ struct LowerConstantsSeparatelyPass
           clonedOp.setLinkageAttr(linkageAttrClonedOp);
 
           // Compute the size (in bytes) needed by the current constant
-          int currentOpSize = estimateConstantTensorMemoryFootprint(globalOp);
+          uint64_t currentOpSize =
+              estimateConstantTensorMemoryFootprint(globalOp);
 
           // If the current op can't fit in the current module for constants
-          if (newModSize + currentOpSize > maximumBytesPerSharedObject) {
+          bool exceedsModuleLimit =
+              currentOpSize > maximumBytesPerSharedObject ||
+              newModSize > maximumBytesPerSharedObject - currentOpSize;
+          if (newModHasConstants && exceedsModuleLimit) {
             // Push the current mod into the collection of produced modules
             producedModules.push_back(newMod);
             // Create a new MLIR module in which we'll be putting the current op
@@ -173,38 +178,29 @@ struct LowerConstantsSeparatelyPass
                 "module for constants only"
                 << "\n");
             newMod = mlir::ModuleOp::create(mlir::UnknownLoc::get(&newContext));
+            newMod->setAttrs(mod->getAttrs());
             // It's size is 0 for now
             newModSize = 0;
-          } else {
-            // The current module has enough space left, so we'll be using it
-            newModSize += currentOpSize;
+            newModHasConstants = false;
           }
+
+          // Account for the constant even when it alone exceeds the preferred
+          // module limit. Such a constant cannot be split here, but it must not
+          // cause an empty module or make the following constants look free.
+          newModSize = currentOpSize > maximumBytesPerSharedObject
+                           ? currentOpSize
+                           : newModSize + currentOpSize;
+          newModHasConstants = true;
 
           // And we insert the cloned operation (constant definition) into the
           // new module
           newMod.push_back(clonedOp);
-
-          // Extract the key from the dense_resource attribute and add it to our
-          // collection of keys that are defined (and which will therefore need
-          // the relevant meta-data copied)
-          if (auto denseResourceAttr =
-                  mlir::dyn_cast<mlir::DenseResourceElementsAttr>(
-                      globalOp->getAttr("value"))) {
-            std::string key = denseResourceAttr.getRawHandle().getKey().str();
-            resourceKeys.push_back(key);
-          }
 
           // 2 - Replace the constant by an extern in the main module (for the
           // code)
           // ------------------------------------------------------------------------
           OpBuilder builder(globalOp.getContext());
           builder.setInsertionPoint(globalOp);
-
-          // Create the necessary attributes
-          auto typeAttr = TypeAttr::get(globalOp.getType());
-          auto symNameAttr = builder.getStringAttr(globalOp.getSymName());
-          auto linkageAttrExternGlobalOp = LLVM::LinkageAttr::get(
-              builder.getContext(), LLVM::Linkage::External);
 
           // Create a new extern GlobalOp
           auto externGlobalOp =
@@ -225,46 +221,18 @@ struct LowerConstantsSeparatelyPass
       }
     });
 
-    // Ensure the new module has the needed resources (containing the definition
-    // of the constants it uses)
-    auto *resourceInterface =
-        mod->getContext()
-            ->getLoadedDialect<mlir::BuiltinDialect>()
-            ->getRegisteredInterface<
-                mlir::ResourceBlobManagerDialectInterface>();
-    auto *newResourceInterface =
-        newMod->getContext()
-            ->getLoadedDialect<mlir::BuiltinDialect>()
-            ->getRegisteredInterface<
-                mlir::ResourceBlobManagerDialectInterface>();
+    // The original module and every constants module deliberately share the
+    // same MLIRContext, and therefore the same BuiltinDialect resource blob
+    // manager. Keep dense_resource blobs under their original keys: moving a
+    // blob and reinserting it into that same manager creates a suffixed key,
+    // while the cloned DenseResourceElementsAttr still references the old key.
 
-    if (resourceInterface && newResourceInterface) {
-      mlir::DialectResourceBlobManager &resourceMap =
-          resourceInterface->getBlobManager();
-      mlir::DialectResourceBlobManager &newResourceMap =
-          newResourceInterface->getBlobManager();
-
-      // For each resource being defined in the new module, move the associated
-      // blob from the original "resource blob manager" to the new one
-      for (const auto &key : resourceKeys) {
-        DialectResourceBlobManager::BlobEntry *blobEntry =
-            resourceMap.lookup(key);
-        if (blobEntry) {
-          // Moving the binary blob
-          DialectResourceBlobManager::BlobEntry &returned =
-              newResourceMap.insert(key, std::move(*(blobEntry->getBlob())));
-        }
-      }
-      // Copy module-level attributes
-      newMod->setAttrs(mod->getAttrs());
-
-    } else {
-      std::cerr << "Error: ResourceBlobManagerDialectInterface not found!"
-                << std::endl;
-    }
-
-    // Push the final module for constants (the non-full one)
-    producedModules.push_back(newMod);
+    // Push the final non-empty constants module. With no constants, returning
+    // no auxiliary module avoids generating and linking a useless empty DSO.
+    if (newModHasConstants)
+      producedModules.push_back(newMod);
+    else
+      newMod.erase();
   }
 
   // Method to access the newly produced modules
