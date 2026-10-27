@@ -23,6 +23,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
+#include <type_traits>
 
 #define DEBUG_TYPE "hexagon-llvm-use-hexagon-routines"
 
@@ -354,6 +355,13 @@ public:
     if (!isConstantOne(numerator))
       return failure();
 
+    // Approximate rsqrt does not preserve strict sqrt-then-divide rounding.
+    // Both operations must permit approximation, for scalars and vectors.
+    if (getElementType(resultType).isF32() &&
+        (fdivOp.getFastmathFlags() != LLVM::FastmathFlags::fast ||
+         sqrtOp.getFastmathFlags() != LLVM::FastmathFlags::fast))
+      return failure();
+
     // scalar float, call qhmath_rsqrt_f directly ---
     if (!isa<VectorType>(resultType)) {
       bool isF32 = resultType.isF32();
@@ -453,6 +461,14 @@ public:
 
   LogicalResult matchAndRewrite(LLVMOp op,
                                 PatternRewriter &rewriter) const override {
+    // Keep strict FP32 sqrt available for generic lowering. Otherwise this
+    // pattern could bypass the reciprocal-sqrt guard by rewriting sqrt alone.
+    if constexpr (std::is_same_v<LLVMOp, LLVM::SqrtOp>) {
+      if (getElementType(op.getType()).isF32() &&
+          op.getFastmathFlags() != LLVM::FastmathFlags::fast)
+        return failure();
+    }
+
     // Check if we have custom Hexagon implementation for this routine.
     // Only process ops with native vector( or size that is factor of native
     // vector width) operands and results and with #results and #operands == 1.

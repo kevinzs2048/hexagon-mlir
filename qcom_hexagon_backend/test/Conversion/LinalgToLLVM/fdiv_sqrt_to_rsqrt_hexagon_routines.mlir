@@ -1,5 +1,43 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(llvm-intr-to-hexagon-routines)' | FileCheck %s -check-prefixes=CHECK
 
+// Strict scalar FP32 must retain both rounding steps, including when only
+// one of the two operations permits approximation.
+// CHECK-LABEL: llvm.func @strict_scalar
+// CHECK: llvm.intr.sqrt
+// CHECK: llvm.fdiv
+// CHECK-NOT: llvm.call @qhmath_rsqrt_f
+// CHECK: llvm.return
+llvm.func @strict_scalar(%arg0: f32) -> f32 {
+  %one = llvm.mlir.constant(1.0 : f32) : f32
+  %sqrt = llvm.intr.sqrt(%arg0) : (f32) -> f32
+  %result = llvm.fdiv %one, %sqrt : f32
+  llvm.return %result : f32
+}
+
+// CHECK-LABEL: llvm.func @fast_sqrt_strict_div
+// CHECK: llvm.intr.sqrt
+// CHECK: llvm.fdiv
+// CHECK-NOT: llvm.call @qhmath_rsqrt_f
+// CHECK: llvm.return
+llvm.func @fast_sqrt_strict_div(%arg0: f32) -> f32 {
+  %one = llvm.mlir.constant(1.0 : f32) : f32
+  %sqrt = llvm.intr.sqrt(%arg0) {fastmathFlags = #llvm.fastmath<fast>} : (f32) -> f32
+  %result = llvm.fdiv %one, %sqrt : f32
+  llvm.return %result : f32
+}
+
+// CHECK-LABEL: llvm.func @strict_sqrt_fast_div
+// CHECK: llvm.intr.sqrt
+// CHECK: llvm.fdiv
+// CHECK-NOT: llvm.call @qhmath_rsqrt_f
+// CHECK: llvm.return
+llvm.func @strict_sqrt_fast_div(%arg0: f32) -> f32 {
+  %one = llvm.mlir.constant(1.0 : f32) : f32
+  %sqrt = llvm.intr.sqrt(%arg0) : (f32) -> f32
+  %result = llvm.fdiv %one, %sqrt {fastmathFlags = #llvm.fastmath<fast>} : f32
+  llvm.return %result : f32
+}
+
 llvm.func @test_fdiv_sqrt_pattern(%arg0: vector<64xf16>, %arg1: vector<64xf32>) -> vector<64xf16> {
 
   // Test f16 vector: 1.0 / sqrt(x) should become rsqrt(x) runtime call
@@ -63,4 +101,40 @@ llvm.func @test_fdiv_sqrt_pattern_scalar(%arg0: f16, %arg1: f32) -> f16 {
   %result = llvm.fsub %rsqrt_f16, %trunc {fastmathFlags = #llvm.fastmath<fast>} : f16
 
   llvm.return %result : f16
+}
+
+// CHECK-LABEL: llvm.func @strict_vector
+// CHECK: llvm.intr.sqrt
+// CHECK: llvm.fdiv
+// CHECK-NOT: llvm.call @_hexagon_runtime_rsqrt
+// CHECK: llvm.return
+llvm.func @strict_vector(%arg0: vector<32xf32>) -> vector<32xf32> {
+  %one = llvm.mlir.constant(dense<1.0> : vector<32xf32>) : vector<32xf32>
+  %sqrt = llvm.intr.sqrt(%arg0) : (vector<32xf32>) -> vector<32xf32>
+  %result = llvm.fdiv %one, %sqrt : vector<32xf32>
+  llvm.return %result : vector<32xf32>
+}
+
+// CHECK-LABEL: llvm.func @fast_sqrt_strict_vector_div
+// CHECK: llvm.call @_hexagon_runtime_sqrt__vf
+// CHECK: llvm.fdiv
+// CHECK-NOT: llvm.call @_hexagon_runtime_rsqrt
+// CHECK: llvm.return
+llvm.func @fast_sqrt_strict_vector_div(%arg0: vector<32xf32>) -> vector<32xf32> {
+  %one = llvm.mlir.constant(dense<1.0> : vector<32xf32>) : vector<32xf32>
+  %sqrt = llvm.intr.sqrt(%arg0) {fastmathFlags = #llvm.fastmath<fast>} : (vector<32xf32>) -> vector<32xf32>
+  %result = llvm.fdiv %one, %sqrt : vector<32xf32>
+  llvm.return %result : vector<32xf32>
+}
+
+// CHECK-LABEL: llvm.func @strict_sqrt_fast_vector_div
+// CHECK: llvm.intr.sqrt
+// CHECK: llvm.fdiv
+// CHECK-NOT: llvm.call @_hexagon_runtime_rsqrt
+// CHECK: llvm.return
+llvm.func @strict_sqrt_fast_vector_div(%arg0: vector<32xf32>) -> vector<32xf32> {
+  %one = llvm.mlir.constant(dense<1.0> : vector<32xf32>) : vector<32xf32>
+  %sqrt = llvm.intr.sqrt(%arg0) : (vector<32xf32>) -> vector<32xf32>
+  %result = llvm.fdiv %one, %sqrt {fastmathFlags = #llvm.fastmath<fast>} : vector<32xf32>
+  llvm.return %result : vector<32xf32>
 }
