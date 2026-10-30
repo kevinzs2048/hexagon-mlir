@@ -12,6 +12,14 @@
 
 include "mlir/Pass/PassBase.td"
 
+def OutlineMatmul : Pass<"hexagon-outline-matmul", "mlir::ModuleOp"> {
+  let summary = "Outline tensor matmuls into reusable non-inlined DSP functions";
+  let constructor = "hexagon::createOutlineMatmulPass()";
+  let options = [Option<"tileForCache", "cache-tile", "bool", "false",
+                        "Tile eligible outlined W8A8 matmuls in 128-column blocks">];
+  let dependentDialects = ["func::FuncDialect", "linalg::LinalgDialect"];
+}
+
 def CollapseAddressSpace :
     Pass<"collapse-address-space"> {
   let summary = "Reduce all address spaces to DDR";

@@ -22,6 +22,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <vector>
 
 #define INIT_MODULE(NAME)                                                      \
   extern const unsigned char hexagon_runtime_module_##NAME[];                  \
@@ -35,12 +36,18 @@
 
 #define ADD_MODULE_CAND(NAME, CONTEXT, EXTERNAL_MODULE, MODULE_CANDIDATES)     \
   otherModule = get_module_##NAME(CONTEXT);                                    \
-  addModToCandidates(EXTERNAL_MODULE, MODULE_CANDIDATES);
+  addModToCandidates(EXTERNAL_MODULE, MODULE_CANDIDATES, candidateOrder);
 
 void condLinkModules(
     llvm::Linker &linker, const std::set<llvm::Module *> &modulesToLink,
-    std::map<llvm::Module *, std::unique_ptr<llvm::Module>> &moduleCandidates) {
-  for (auto otherMod : modulesToLink) {
+    std::map<llvm::Module *, std::unique_ptr<llvm::Module>> &moduleCandidates,
+    const std::vector<llvm::Module *> &candidateOrder) {
+  // Pointer sets provide membership, not a reproducible iteration order.
+  // Allocator/ASLR differences must not reorder runtime functions in the
+  // generated object. Preserve explicit registration order for linking.
+  for (auto otherMod : candidateOrder) {
+    if (!modulesToLink.count(otherMod))
+      continue;
     if (linker.linkInModule(std::move(moduleCandidates[otherMod])))
       llvm::report_fatal_error("Error linking module\n");
   }
@@ -68,6 +75,8 @@ INIT_MODULE(HexagonAPI);
 INIT_MODULE(HexagonBuffer);
 INIT_MODULE(HexagonBufferAlias);
 INIT_MODULE(HexagonCAPI);
+INIT_MODULE(HexagonLibcCompat);
+INIT_MODULE(HexagonMemrefCopy);
 INIT_MODULE(HexKLAPI);
 INIT_MODULE(RuntimeDMA);
 INIT_MODULE(UserDMA);
@@ -103,12 +112,16 @@ void buildFunctionModuleMaps(
     std::unordered_map<std::string, llvm::Module *> &definingMod,
     std::unordered_map<llvm::Module *, std::set<std::string>> &declsInMod,
     const std::map<llvm::Module *, std::unique_ptr<llvm::Module>>
-        &moduleCandidates) {
-  for (auto it = moduleCandidates.begin(); it != moduleCandidates.end(); ++it) {
-    for (auto funcDecl : collectFuncsInMod(it->second, true))
-      declsInMod[it->first].insert(funcDecl);
-    for (auto funcDef : collectFuncsInMod(it->second, false))
-      definingMod[funcDef] = it->first;
+        &moduleCandidates,
+    const std::vector<llvm::Module *> &candidateOrder) {
+  // Duplicate definitions, if present, must also use a stable precedence.
+  // As before, the last visited candidate wins; visits now follow registration.
+  for (auto candidate : candidateOrder) {
+    const auto &mod = moduleCandidates.at(candidate);
+    for (auto funcDecl : collectFuncsInMod(mod, true))
+      declsInMod[candidate].insert(funcDecl);
+    for (auto funcDef : collectFuncsInMod(mod, false))
+      definingMod[funcDef] = candidate;
   }
 }
 
@@ -156,8 +169,11 @@ void getDependentCandidates(
 
 void addModToCandidates(
     std::unique_ptr<llvm::Module> &otherModule,
-    std::map<llvm::Module *, std::unique_ptr<llvm::Module>> &moduleCandidates) {
+    std::map<llvm::Module *, std::unique_ptr<llvm::Module>> &moduleCandidates,
+    std::vector<llvm::Module *> &candidateOrder) {
   llvm::Module *ptr = otherModule.get();
+  assert(ptr && !moduleCandidates.count(ptr));
+  candidateOrder.push_back(ptr);
   moduleCandidates[ptr] = std::move(otherModule);
 }
 
@@ -173,6 +189,7 @@ void mlir::Hexagon::Translate::linkRuntimeModules(
   // keep track of the unique pointers since at the end of the day we need
   // to call linker.linkInModule which only accepts a unique pointer
   std::map<llvm::Module *, std::unique_ptr<llvm::Module>> moduleCandidates;
+  std::vector<llvm::Module *> candidateOrder;
 
   std::unique_ptr<llvm::Module> otherModule;
   auto it = options_map.find("device_type");
@@ -183,6 +200,10 @@ void mlir::Hexagon::Translate::linkRuntimeModules(
   ADD_MODULE_CAND(HexagonBuffer, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(HexagonBufferAlias, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(HexagonCAPI, ctx, otherModule, moduleCandidates);
+  otherModule = get_module_HexagonLibcCompat(ctx);
+  llvm::Module *libcCompatModule = otherModule.get();
+  addModToCandidates(otherModule, moduleCandidates, candidateOrder);
+  ADD_MODULE_CAND(HexagonMemrefCopy, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(RuntimeDMA, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(HexKLAPI, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(UserDMA, ctx, otherModule, moduleCandidates);
@@ -191,18 +212,22 @@ void mlir::Hexagon::Translate::linkRuntimeModules(
   llvm::Module *mainModule = module.get();
   // module ownership passed to moduleCandidates
   // it will be passed back to module by end of this function
-  addModToCandidates(module, moduleCandidates);
+  addModToCandidates(module, moduleCandidates, candidateOrder);
   std::unordered_map<std::string, llvm::Module *> definingMod;
   std::unordered_map<llvm::Module *, std::set<std::string>> declsInMod;
-  buildFunctionModuleMaps(definingMod, declsInMod, moduleCandidates);
+  buildFunctionModuleMaps(definingMod, declsInMod, moduleCandidates, candidateOrder);
 
   // we add module to the modules link just temporarily to
   // detect its external module dependencies
-  std::set<llvm::Module *> modulesToLink = {mainModule};
+  // LLVM may legalize intrinsics such as llvm.roundeven.f32 into libcalls only
+  // during target code generation. Such a dependency is not visible to the
+  // declaration-based scan above, so the small compatibility module must
+  // always be linked when the Hexagon runtime is enabled.
+  std::set<llvm::Module *> modulesToLink = {mainModule, libcCompatModule};
   getDependentCandidates(modulesToLink, definingMod, declsInMod);
   modulesToLink.erase(mainModule);
 
-  condLinkModules(linker, modulesToLink, moduleCandidates);
+  condLinkModules(linker, modulesToLink, moduleCandidates, candidateOrder);
   // unique pointer to main module is still used afterwards
   module = std::move(moduleCandidates[mainModule]);
 }

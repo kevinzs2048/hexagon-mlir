@@ -29,11 +29,13 @@
 #include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h" // For divideCeil
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h" // For the base class LowerConstantsSeparatelyBase
 
@@ -75,6 +77,36 @@ struct LowerConstantsSeparatelyPass
   // be created (can happen several times, leading to several const-only mods)
   static constexpr uint64_t maximumBytesPerSharedObject =
       500'000'000; // 0.5 GB
+
+  // Opt-in only: assertion strings belong to the code which references them,
+  // not to a reusable model-weight DSO. LLVM's print-call helper can number
+  // these private symbols differently for successive modules in one process.
+  // Retaining their original definitions also retains all assertion behavior.
+  static constexpr llvm::StringLiteral keepAssertMessagesAttr =
+      "hexagon.keep_assert_messages_in_main";
+
+  static bool isPrivateAssertMessage(LLVM::GlobalOp op) {
+    if (!op.getConstant() || op.getLinkage() != LLVM::Linkage::Private)
+      return false;
+    llvm::StringRef name = op.getSymName();
+    if (name != "assert_msg") {
+      if (!name.consume_front("assert_msg_") || name.empty())
+        return false;
+      for (char c : name)
+        if (c < '0' || c > '9')
+          return false;
+    }
+    auto type = dyn_cast<LLVM::LLVMArrayType>(op.getType());
+    auto value = dyn_cast_or_null<DenseIntElementsAttr>(op.getValueAttr());
+    if (!type || !type.getElementType().isInteger(8) || !value ||
+        value.getType().getRank() != 1 ||
+        !value.getElementType().isInteger(8) ||
+        type.getNumElements() != uint64_t(value.getNumElements()) ||
+        !type.getNumElements() || type.getNumElements() > 65536)
+      return false;
+    return (*(value.getValues<llvm::APInt>().begin() +
+              (value.getNumElements() - 1))).isZero();
+  }
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
     registry.insert<mlir::LLVM::LLVMDialect>();
@@ -134,6 +166,31 @@ struct LowerConstantsSeparatelyPass
     mlir::MLIRContext &newContext = *(mod.getContext());
     producedModules.clear();
 
+    llvm::SmallPtrSet<Operation *, 16> retainedMessages;
+    if (Attribute flag = mod->getAttr(keepAssertMessagesAttr)) {
+      if (!isa<UnitAttr>(flag)) {
+        mod.emitError() << keepAssertMessagesAttr << " must be a unit attribute";
+        signalPassFailure();
+        return;
+      }
+      // Validate before mutating anything. A reference from another global
+      // initializer could cross the new DSO boundary; do not hide that case.
+      for (auto global : mod.getOps<LLVM::GlobalOp>()) {
+        if (!isPrivateAssertMessage(global))
+          continue;
+        auto uses = SymbolTable::getSymbolUses(global, mod);
+        if (!uses || llvm::any_of(*uses, [](const SymbolTable::SymbolUse &use) {
+              return !use.getUser()->getParentOfType<LLVM::LLVMFuncOp>();
+            })) {
+          global.emitError("cannot retain assertion message with non-function "
+                           "or unknown symbol uses");
+          signalPassFailure();
+          return;
+        }
+        retainedMessages.insert(global.getOperation());
+      }
+    }
+
     // Create a new MLIR module in which we'll be putting the current op
     DBG("[LowerConstantsSeparately] Creating a new module for constants only"
         << "\n");
@@ -151,7 +208,7 @@ struct LowerConstantsSeparatelyPass
       // If it's a GlobalOp...
       if (auto globalOp = llvm::dyn_cast<mlir::LLVM::GlobalOp>(op)) {
         // And if it's a constant...
-        if (globalOp.getConstant()) {
+        if (globalOp.getConstant() && !retainedMessages.contains(op)) {
           // 1 - Copy the constant definition to the new module being created
           // ------------------------------------------------------------------------
           // Then we clone the global constant

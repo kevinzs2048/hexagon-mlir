@@ -17,6 +17,11 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert Linalg to LLVM";
   let constructor = "hexagon::createLinalgToLLVMPass()";
   let options = [
+    Option<"outlineMatmul", "outline-matmul", "bool",
+           /*default=*/"false",
+           "Experimental DSP-local matmul reuse; may inhibit fusion">,
+    Option<"tileOutlinedMatmul", "tile-outlined-matmul", "bool",
+           /*default=*/"false", "Cache-tile outlined W8A8 matmuls; requires outline-matmul">,
     Option<"puntBuffer", "punt-buffer", "bool",
            /*default=*/"true",
            "Punt input kernel buffer pointer directly to user instead"

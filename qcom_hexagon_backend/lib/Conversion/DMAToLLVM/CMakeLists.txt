@@ -4,6 +4,7 @@ add_mlir_conversion_library(DMAToLLVM
 
   DEPENDS
   DMAToLLVMConversionPassIncGen
+  HexagonMemTableGen
 
   LINK_COMPONENTS
   Core
@@ -13,4 +14,3 @@ add_mlir_conversion_library(DMAToLLVM
   MLIRIR
   HexagonCommon
 )
-

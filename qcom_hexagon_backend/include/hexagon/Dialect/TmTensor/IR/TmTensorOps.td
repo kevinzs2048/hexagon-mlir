@@ -55,4 +55,44 @@ def TmTensor_AttentionOp : TmTensor_Op<"attention", []> {
   let hasVerifier = 1;
 }
 
+// Tensor scan emitted by torch-mlir for aten.cumsum. Keep the upstream custom
+// syntax so ordinary exported programs can be read without source rewriting.
+def TmTensor_YieldOp : TmTensor_Op<"yield", [Pure, Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$values);
+  let assemblyFormat = "$values attr-dict (`:` type($values)^)?";
+}
+
+def TmTensor_ScanOp : TmTensor_Op<"scan", [SingleBlock]> {
+  let summary = "Inclusive or exclusive ordered tensor scan";
+  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$output,
+                       AnyRankedTensor:$accumulator,
+                       I64Attr:$dimension, BoolAttr:$inclusive);
+  let results = (outs AnyRankedTensor:$result, AnyRankedTensor:$accumulator_result);
+  let regions = (region SizedRegion<1>:$region);
+  let assemblyFormat = [{
+    `dimension` `(` $dimension `)` `inclusive` `(` $inclusive `)`
+    `ins` `(` $input `:` type($input) `)`
+    `outs` `(` $output `,` $accumulator `:` type($output) `,` type($accumulator) `)`
+    $region attr-dict `->` type($result) `,` type($accumulator_result)
+  }];
+  let hasVerifier = 1;
+}
+
+// Ordinary torch-mlir indexed updates, including functionalized index_copy_.
+def TmTensor_ScatterOp : TmTensor_Op<"scatter", [SingleBlock]> {
+  let summary = "Ordered indexed updates of a tensor";
+  let arguments = (ins AnyRankedTensor:$updates, AnyRankedTensor:$indices,
+                       AnyRankedTensor:$original,
+                       DenseI64ArrayAttr:$dimension_map, BoolAttr:$unique_indices);
+  let results = (outs AnyRankedTensor:$result);
+  let regions = (region SizedRegion<1>:$region);
+  let assemblyFormat = [{
+    attr-dict `unique_indices` `(` $unique_indices `)`
+    `ins` `(` $updates `,` $indices `:` type($updates) `,` type($indices) `)`
+    `outs` `(` $original `:` type($original) `)`
+    $region `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
 #endif // HEXAGON_DIALECT_TMTENSOR_IR_TMTENSOR_OPS_TD

@@ -28,6 +28,7 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
@@ -56,6 +57,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <regex>
+#include <chrono>
 
 #include "LinkRuntimeModules.h"
 
@@ -67,9 +69,57 @@
 // Wrapper over std::runtime_error to signal LLVM IR parsing errors
 void fail(const std::string &message) { throw std::runtime_error(message); }
 
+namespace {
+struct CompileProgress {
+  bool enabled = mlir::hexagon::isEnvTrue("HEXAGON_COMPILE_PROGRESS");
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  void report(llvm::StringRef phase) const {
+    if (!enabled)
+      return;
+    double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    llvm::errs() << "[hexmlir-compile] " << seconds << "s: " << phase << "\n";
+    llvm::errs().flush();
+  }
+};
+} // namespace
+
 std::unique_ptr<llvm::Module>
-fixAlignedAllocTypes(llvm::LLVMContext &context, llvm::Module *originalModule,
+fixAlignedAllocTypes(llvm::LLVMContext &context,
+                     std::unique_ptr<llvm::Module> &originalModule,
                      const std::string &outputFilePath) {
+
+  // Most modules already use the target's i32 size_t ABI. Serializing all
+  // constant weights, running two regex replacements, and reparsing a model
+  // solely to discover that nothing changed is prohibitively expensive.
+  bool needsFix = false;
+  if (auto *allocator = originalModule->getFunction("aligned_alloc")) {
+    auto *type = allocator->getFunctionType();
+    needsFix = type->getNumParams() == 2 &&
+               type->getParamType(0)->isIntegerTy(64) &&
+               type->getParamType(1)->isIntegerTy(64);
+    for (auto &function : *originalModule)
+      for (auto &block : function)
+        for (auto &instruction : block)
+          if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+            if (call->getCalledOperand()->stripPointerCasts() == allocator &&
+                call->arg_size() == 2 &&
+                call->getArgOperand(0)->getType()->isIntegerTy(64) &&
+                call->getArgOperand(1)->getType()->isIntegerTy(64))
+              needsFix = true;
+  }
+  if (!needsFix) {
+    if (!outputFilePath.empty()) {
+      std::error_code error;
+      llvm::raw_fd_ostream stream(outputFilePath, error, llvm::sys::fs::OF_Text);
+      if (error)
+        fail("Cannot write LLVM IR: " + error.message());
+      originalModule->print(stream, nullptr);
+    }
+    if (mlir::hexagon::isEnvTrue("HEXAGON_COMPILE_PROGRESS"))
+      llvm::errs() << "[hexmlir-compile] native allocator ABI: skipped IR text round trip\n";
+    return std::move(originalModule);
+  }
 
   // Dump LLVM IR to string
   std::string llvm_ir_str;
@@ -385,6 +435,8 @@ mlir::ModuleOp parseMlirFromString(const std::string &src,
 std::vector<std::vector<char>> translateLinalgToObj(
     mlir::ModuleOp &linalg_module,
     const std::unordered_map<std::string, std::string> &options_map) {
+  CompileProgress progress;
+  progress.report("lowering Linalg to LLVM dialect");
   // The collection of object codes (each seen as a sequence of
   // bytes/char) that will be produced
   std::vector<std::vector<char>> mods_object_codes_as_bytes;
@@ -428,6 +480,7 @@ std::vector<std::vector<char>> translateLinalgToObj(
            "module" +
            std::to_string(module_id));
 
+    progress.report("translating and optimizing LLVM IR");
     llvm::LLVMContext llvmContext;
     DBG("[Module " << module_id
                    << "] - STEP 1 - Calling translateHexagonMlirLlvmToLLVMIR"
@@ -450,6 +503,7 @@ std::vector<std::vector<char>> translateLinalgToObj(
     // Only if it's the principal module (=code), link the runtime modules
     // with it
     if (module_id == 0) {
+      progress.report("linking runtime");
       DBG("[Module " << module_id
                      << "] - Extra step - Calling linkRuntimeModules for the "
                         "principal module"
@@ -480,8 +534,9 @@ std::vector<std::vector<char>> translateLinalgToObj(
     DBG("[Module " << module_id
                    << "] - STEP 2 - Calling llvm_module_to_obj_string"
                    << "\n");
+    progress.report("checking allocator ABI");
     auto replacedAlignedModule =
-        fixAlignedAllocTypes(llvmContext, current_llvm_mod.get(), "");
+        fixAlignedAllocTypes(llvmContext, current_llvm_mod, "");
 
     if (!replacedAlignedModule)
       fail("Failed to fix aligned_alloc types in LLVM module for the current "
@@ -502,8 +557,10 @@ std::vector<std::vector<char>> translateLinalgToObj(
       }
     }
 
+    progress.report("running Hexagon machine-code generation");
     std::vector<char> object_code_as_bytes =
         mlir::hexagon::llvm_module_to_obj_string(replacedAlignedModule);
+    progress.report("object ready");
     // For now, the collection returned has only one object code
     mods_object_codes_as_bytes.push_back(object_code_as_bytes);
   }

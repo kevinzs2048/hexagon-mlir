@@ -476,7 +476,7 @@ struct ConvTilingPass : public ::impl::ConvTilingBase<ConvTilingPass> {
     // Crouton aligned tensor shapes are not peeled in this pipeline.
     mlir::PassManager pm(funcOp->getContext());
     pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createSCFForLoopPeeling());
+    pm.addPass(mlir::createForLoopPeelingPass());
     pm.addPass(mlir::createCanonicalizerPass());
     if (mlir::failed(pm.run(funcOp))) {
       DBG("Something failed in the post pass pipeline\n");

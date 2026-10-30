@@ -37,7 +37,24 @@ struct ExpandMathOpsPass : public ::impl::ExpandMathOpsBase<ExpandMathOpsPass> {
   void runOnOperation() override {
     auto moduleOp = getOperation();
     RewritePatternSet patterns(moduleOp.getContext());
-    math::populateExpansionPatterns(patterns);
+    // The pinned LLVM revision exposes the expansion patterns individually.
+    // Keep the same set as the compiler used to qualify the Qwen model.
+    populateExpandTanPattern(patterns);
+    populateExpandSinhPattern(patterns);
+    populateExpandCoshPattern(patterns);
+    populateExpandTanhPattern(patterns);
+    populateExpandAsinhPattern(patterns);
+    populateExpandAcoshPattern(patterns);
+    populateExpandAtanhPattern(patterns);
+    populateExpandRsqrtPattern(patterns);
+    populateExpandCtlzPattern(patterns);
+    populateExpandFmaFPattern(patterns);
+    populateExpandCeilFPattern(patterns);
+    populateExpandExp2FPattern(patterns);
+    populateExpandPowFPattern(patterns);
+    populateExpandFPowIPattern(patterns);
+    populateExpandRoundFPattern(patterns);
+    populateExpandRoundEvenPattern(patterns);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       return signalPassFailure();
   }

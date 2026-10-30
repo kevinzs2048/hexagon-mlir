@@ -233,7 +233,11 @@ void HoistScalarOpsPass::hoistOperations(
       // If operand is a block argument from a rank-0 tensor input,
       // extract the scalar value from the tensor
       if (auto barg = dyn_cast<BlockArgument>(operand)) {
-        if (barg.getArgNumber() < oldNumInputs) {
+        // Argument numbers are local to their block. A captured function or
+        // enclosing-loop argument must stay captured, not be mistaken for a
+        // similarly numbered input of this linalg.generic.
+        if (barg.getOwner() == gop.getBody() &&
+            barg.getArgNumber() < oldNumInputs) {
           Value inputTensor =
               gop.getDpsInputOperand(barg.getArgNumber())->get();
           Value extracted =

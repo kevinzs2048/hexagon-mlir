@@ -1,4 +1,5 @@
-// RUN: linalg-hexagon-opt %s -linalg-to-llvm | FileCheck %s
+// RUN: linalg-hexagon-opt %s -linalg-to-llvm | FileCheck %s --check-prefix=FAST
+// RUN: linalg-hexagon-opt %s -linalg-to-llvm='add-fastmath=false' | FileCheck %s --check-prefix=STRICT
 
 module {
 func.func @kernel(%x: memref<1024xf16>, %y: memref<f16>) {
@@ -15,4 +16,5 @@ func.func @kernel(%x: memref<1024xf16>, %y: memref<f16>) {
    return
  }
 }
-// CHECK: llvm.intr.vector.reduce.fmaximum(%{{.*}})  {fastmathFlags = #llvm.fastmath<fast>} : (vector<64xf16>) -> f16
+// FAST: llvm.intr.vector.reduce.fmaximum(%{{.*}})  {fastmathFlags = #llvm.fastmath<fast>} : (vector<64xf16>) -> f16
+// STRICT: llvm.intr.vector.reduce.fmaximum(%{{.*}}) : (vector<64xf16>) -> f16

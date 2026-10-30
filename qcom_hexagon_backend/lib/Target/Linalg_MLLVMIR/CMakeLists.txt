@@ -1,6 +1,9 @@
 add_mlir_translation_library(TritonLinalgLLVM
         MLLVMIRTranslation.cpp
 
+        DEPENDS
+        LinalgToLLVMConversionPassIncGen
+
         LINK_COMPONENTS
         Core
 

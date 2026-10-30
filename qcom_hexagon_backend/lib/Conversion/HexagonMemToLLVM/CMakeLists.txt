@@ -4,6 +4,8 @@ add_mlir_conversion_library(HexagonMemToLLVM
 
   DEPENDS
   HexagonMemToLLVMConversionPassIncGen
+  LinalgToLLVMConversionPassIncGen
+  HexagonMemTableGen
 
   LINK_COMPONENTS
   Core

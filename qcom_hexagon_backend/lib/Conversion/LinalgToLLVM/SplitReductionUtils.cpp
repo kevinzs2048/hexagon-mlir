@@ -819,11 +819,23 @@ tileToPartialReduction(Operation *op, OpBuilder &b, Location loc,
   OpBuilder::InsertionGuard guard(b);
   auto linalgOp = cast<LinalgOp>(op);
 
-  // Canditate for moving init operands (outs) to ins.
+  // A split axis becomes parallel, but other reduction axes may remain.
+  // In that case the accumulator must keep reading the evolving outs value.
+  // Mapping it to an ins operand instead rereads the initial partial tensor
+  // on every outer reduction iteration and keeps only the last contribution.
+  bool hasUnsplitReduction = false;
+  for (auto [index, iterator] :
+       llvm::enumerate(linalgOp.getIteratorTypesArray()))
+    if (iterator == utils::IteratorType::reduction &&
+        !reductionDims.contains(index))
+      hasUnsplitReduction = true;
+
+  // Move an accumulator to ins only for a fully parallel partial operation.
   auto outputOperands = linalgOp.getDpsInitsMutable();
   SetVector<OpOperand *> candidates;
   for (OpOperand &op : outputOperands) {
-    if (linalgOp.getMatchingBlockArgument(&op).use_empty()) {
+    if (hasUnsplitReduction ||
+        linalgOp.getMatchingBlockArgument(&op).use_empty()) {
       continue;
     }
     candidates.insert(&op);
@@ -875,8 +887,11 @@ tileToPartialReduction(Operation *op, OpBuilder &b, Location loc,
   SmallVector<AffineMap> newMaps;
   if (tilingStrategy ==
       ReductionTilingStrategy::PartialReductionOuterReduction) {
-    // Add the tiledInits to inputs
-    tiledInputs.append(tiledInits.begin(), tiledInits.end());
+    // Only selected accumulators have matching extra input maps/arguments.
+    for (auto [operand, value] :
+         llvm::zip_equal(linalgOp.getDpsInitsMutable(), tiledInits))
+      if (candidates.contains(&operand))
+        tiledInputs.push_back(value);
 
     // Update the indexing maps: Inputs -- Init operand moved to ins -- outs
     // Init operands are usually stored as part of outs for reduction loop
@@ -1445,6 +1460,19 @@ namespace hexagon {
 // Split the reduction loop into parallel computation,
 // followed by reduction on the final output.
 LogicalResult SplitReductionLinalgOp(linalg::LinalgOp generalizeOp) {
+  // Partial-reduction tiling below assumes a statically bounded reduction
+  // tile. For a dynamic operand/result it can otherwise materialize a
+  // vector.mask whose nested op is not MaskableOpInterface. Leave that op to
+  // the ordinary dynamic linalg lowering instead of producing invalid IR.
+  auto hasDynamicShape = [](Type type) {
+    auto shaped = dyn_cast<ShapedType>(type);
+    return shaped && !shaped.hasStaticShape();
+  };
+  if (llvm::any_of(generalizeOp->getOperandTypes(), hasDynamicShape) ||
+      llvm::any_of(generalizeOp->getResultTypes(), hasDynamicShape)) {
+    DBG("-> skip split reduction with dynamic shape.\n");
+    return failure();
+  }
 
   // Operation which have PartialReductionOpInterface
   // are candidates for split reduction
@@ -1468,6 +1496,16 @@ LogicalResult SplitReductionLinalgOp(linalg::LinalgOp generalizeOp) {
   if (!dataTileSize.has_value())
     return failure();
 
+  // A fused BF16 -> FP32 sum needs FP32 partial accumulators. Size this
+  // newly admitted mixed-precision case by the accumulator vector, not the
+  // narrower input (64 BF16 lanes would require two FP32 HVX registers).
+  bool widensBF16Input = llvm::any_of(
+      generalizeOp.getBlock()->getOps<arith::ExtFOp>(), [](arith::ExtFOp op) {
+        return op.getIn().getType().isBF16() && op.getType().isF32();
+      });
+  if (widensBF16Input)
+    *dataTileSize = std::min(*dataTileSize, nativeVectorWidthInBytes / 4);
+
   tileSizes[numLoops - 1] = dataTileSize.value();
 
   // Apply split reduction on the reduction loop
@@ -1487,6 +1525,27 @@ LogicalResult SplitReductionLinalgOp(linalg::LinalgOp generalizeOp) {
 bool IsSplitReductionCandidate(linalg::LinalgOp op) {
   auto generalizedOp = cast<linalg::GenericOp>(op);
   for (Operation &op : generalizedOp.getBody()->getOperations()) {
+    // Fusion places the exact BF16-input widening inside FP32 RMSNorm sums.
+    // Also admit one BF16 residual add of two input arguments. Keep that add
+    // in BF16: widening its operands before addition would erase the required
+    // rounding. Never admit an accumulator dependency or arbitrary producer.
+    // The partial-reduction interface still validates the FP32 combiner.
+    if (auto extend = dyn_cast<arith::ExtFOp>(op)) {
+      if (!extend.getIn().getType().isBF16() || !extend.getType().isF32())
+        return false;
+      auto isInput = [&](Value value) {
+        auto input = dyn_cast<BlockArgument>(value);
+        return input && input.getOwner() == generalizedOp.getBody() &&
+               input.getArgNumber() < generalizedOp.getNumDpsInputs();
+      };
+      if (isInput(extend.getIn()))
+        continue;
+      if (auto residual = extend.getIn().getDefiningOp<arith::AddFOp>())
+        if (residual->getBlock() == generalizedOp.getBody() &&
+            isInput(residual.getLhs()) && isInput(residual.getRhs()))
+          continue;
+      return false;
+    }
     if (!(isa<arith::AddFOp>(op) || isa<linalg::YieldOp>(op) ||
           isa<arith::MaxNumFOp>(op) || isa<arith::MinNumFOp>(op) ||
           isa<arith::MulFOp>(op))) {

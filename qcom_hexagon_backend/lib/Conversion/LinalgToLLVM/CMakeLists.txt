@@ -24,6 +24,15 @@ add_mlir_conversion_library(LinalgToLLVM
   
   DEPENDS
   LinalgToLLVMConversionPassIncGen
+  TransformsPassIncGen
+  DMAToLLVMConversionPassIncGen
+  HexKLToLLVMConversionPassIncGen
+  HexagonMemToLLVMConversionPassIncGen
+  HexagonMemTableGen
+  HexagonTPtrTableGen
+  HexKLTableGen
+  TmTensorTableGen
+  TTXTableGen
 
   LINK_COMPONENTS
   Core
@@ -38,6 +47,7 @@ add_mlir_conversion_library(LinalgToLLVM
   MLIRTransforms
   MLIRMathTransforms
   MLIRSupport
+  MLIRUBToLLVM
   MLIRRegisterAllExtensions
 
   Transforms

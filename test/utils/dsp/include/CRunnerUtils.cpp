@@ -21,7 +21,9 @@
 #include <cstdlib>
 #include <string.h>
 
-extern "C" void memrefCopy(int64_t elemSize, UnrankedMemRefType<char> *srcArg,
+// Compatibility fallback for objects that do not carry the backend runtime.
+// A backend-provided strong definition must win when both are linked.
+extern "C" __attribute__((weak)) void memrefCopy(int64_t elemSize, UnrankedMemRefType<char> *srcArg,
                            UnrankedMemRefType<char> *dstArg) {
   DynamicMemRefType<char> src(*srcArg);
   DynamicMemRefType<char> dst(*dstArg);

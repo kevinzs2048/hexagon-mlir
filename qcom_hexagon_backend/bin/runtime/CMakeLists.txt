@@ -4,10 +4,16 @@ endif()
 if (NOT DEFINED ENV{HEXAGON_ARCH_VERSION})
     message(FATAL_ERROR "HEXAGON_ARCH_VERSION not set.  Please set the Hexagon arch version according to target device e.g., 75.")
 endif()
+if(NOT LLVM_SYSPATH)
+    set(LLVM_SYSPATH "$ENV{LLVM_SYSPATH}")
+endif()
+if(NOT LLVM_SYSPATH)
+    message(FATAL_ERROR "LLVM_SYSPATH must be set as a CMake variable or in the environment.")
+endif()
 add_subdirectory(multithreading)
 
 set(HEXAGON_MLIR_ROOT_LOCAL $ENV{HEXAGON_MLIR_ROOT})
-set(LLVM_BIN_DIR $ENV{LLVM_SYSPATH}/bin)
+set(LLVM_BIN_DIR "${LLVM_SYSPATH}/bin")
 message(STATUS "LLVM BIN DIR is ${LLVM_BIN_DIR}")
 
 ###############################################################################
@@ -79,6 +85,8 @@ set(HEXAGON_RUNTIME_SRC
     src/HexagonBufferAlias.cpp
     src/HexagonAPI.cpp
     src/HexagonCAPI.cpp
+    src/HexagonLibcCompat.cpp
+    src/HexagonMemrefCopy.cpp
     src/HexKLAPI.cpp
 )
 
@@ -99,10 +107,15 @@ foreach (i IN LISTS HEXAGON_RUNTIME_SRC)
     set(BC ${src_name}.bc)
     set(BC_2_CPP ${src_name}_bc.cpp)
     get_filename_component(BASENAME ${src_name} NAME)
+    set(RUNTIME_SOURCE_DEPS ${SRC_FILE})
+    if(src_name STREQUAL "IntrinsicsHVX")
+        list(APPEND RUNTIME_SOURCE_DEPS ${CMAKE_CURRENT_SOURCE_DIR}/include/ExpSpecialValues.h)
+        list(APPEND RUNTIME_SOURCE_DEPS ${CMAKE_CURRENT_SOURCE_DIR}/include/ExpRangeReduction.h)
+    endif()
     # We need to make sure that CPLUS_INCLUDE_PATH is empty for successful compilation on Ubuntu 22 (as for Ubuntu 22 it contains the path of libstdc++'s headers files *for x86*)
     add_custom_command(OUTPUT ${BC}
                      COMMAND env CPLUS_INCLUDE_PATH="" ${COMPILER} ${HEXAGON_INCLUDES} ${HEXAGON_FLAGS} -emit-llvm -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -c ${SRC_FILE} -o ${BC}
-                     DEPENDS ${SRC_FILE}
+                     DEPENDS ${RUNTIME_SOURCE_DEPS}
                      VERBATIM)
     add_custom_command(OUTPUT ${BC_2_CPP}
                        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/bitcode2array.py ${BC} ${BASENAME} ${BC_2_CPP}

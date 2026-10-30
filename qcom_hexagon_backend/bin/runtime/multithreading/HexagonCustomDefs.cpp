@@ -90,7 +90,10 @@ uint64_t xxh3_64bits(ArrayRef<uint8_t> data) {
 
 } // namespace llvm
 
-extern "C" __attribute__((visibility("default"))) void *
+// The core Hexagon runtime provides the strong compatibility definition. Keep
+// this async-runtime fallback weak so linking both runtimes cannot produce a
+// duplicate symbol.
+extern "C" __attribute__((weak, visibility("default"))) void *
 aligned_alloc(size_t alignment, size_t size) {
   return memalign(alignment, size);
 }

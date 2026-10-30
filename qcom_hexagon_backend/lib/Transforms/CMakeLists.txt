@@ -9,6 +9,7 @@ add_mlir_library(Transforms
   PuntBufferPass.cpp
   RVO.cpp
   ScheduleMatmulForHVXPass.cpp
+  OutlineMatmulPass.cpp
   GeneralizePass.cpp
   ReplaceWithLibraryCallsPass.cpp
   VectorLoweringPass.cpp
@@ -53,16 +54,28 @@ add_mlir_library(Transforms
 
   DEPENDS
   TransformsPassIncGen
+  LinalgToLLVMConversionPassIncGen
+  TritonTableGen
+  TritonGPUTableGen
+  TritonGPUAttrDefsIncGen
+  TritonGPUTypeInterfacesIncGen
+  HexagonMemTableGen
+  HexagonTPtrTableGen
+  HexKLTableGen
+  TmTensorTableGen
+  TTXTableGen
 
   LINK_COMPONENTS
   Core
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRControlFlowDialect
   MLIRDialectUtils
   MLIRIR
   MLIRMathDialect
   MLIRPass
+  MLIRSCFDialect
   MLIRTensorDialect
   MLIRTransforms
   MLIRMathTransforms

@@ -69,6 +69,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerReduceContractionRankPass();
   mlir::hexagon::registerHoistScalarOpsPass();
   mlir::hexagon::registerScheduleMatmulForHVXPass();
+  mlir::hexagon::registerOutlineMatmulPass();
   mlir::hexagon::registerLinalgGeneralizePass();
   mlir::hexagon::registerHexagonDoubleBufferGenericS1Pass();
   mlir::hexagon::registerHexagonDoubleBufferGenericS2Pass();

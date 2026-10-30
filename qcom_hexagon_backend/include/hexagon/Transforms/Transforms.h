@@ -42,6 +42,8 @@ std::unique_ptr<OperationPass<func::FuncOp>> createExpandMathOpsPass();
 
 std::unique_ptr<OperationPass<ModuleOp>> createFastInversePass();
 
+std::unique_ptr<OperationPass<ModuleOp>> createOutlineMatmulPass(bool tileForCache = false);
+
 std::unique_ptr<OperationPass<ModuleOp>> createHexagonAddFastMathPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>

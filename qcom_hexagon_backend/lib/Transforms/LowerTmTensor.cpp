@@ -27,16 +27,19 @@
 
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/Support/Debug.h"
 #include <algorithm>
+#include <functional>
 #include <numeric>
 #include <vector>
 
 #include "hexagon/Dialect/TmTensor/IR/TmTensorDialect.h"
 #include "hexagon/Transforms/Transforms.h"
+#include "hexagon/Transforms/LowerTmTensorScatter.h"
 
 #define DEBUG_TYPE "hexagon-lower-tm-tensor"
 
@@ -64,6 +67,81 @@ struct HexagonLowerTmTensorPass
   }
 
   void runOnOperation() override;
+};
+
+// Preserve ordered scan semantics before ordinary tensor bufferization. The
+// first inclusive element copies input; the first exclusive element copies the
+// initial accumulator. As in torch-mlir's scalar scan implementation, the
+// accumulator result is updated only on subsequent elements (length 0/1 keeps
+// its initial value). No reassociation or identity element is assumed.
+struct LowerScanOp : public OpRewritePattern<ScanOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ScanOp op, PatternRewriter &rewriter) const final {
+    Location loc = op.getLoc();
+    auto inputType = cast<RankedTensorType>(op.getInput().getType());
+    unsigned scanDim = op.getDimension();
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    SmallVector<Value> bounds, indices;
+    for (int64_t dim = 0; dim < inputType.getRank(); ++dim)
+      bounds.push_back(tensor::DimOp::create(rewriter, loc, op.getInput(), dim));
+
+    std::function<SmallVector<Value>(OpBuilder &, unsigned, ValueRange)> nest;
+    nest = [&](OpBuilder &b, unsigned dim, ValueRange carried) -> SmallVector<Value> {
+      if (dim < bounds.size()) {
+        auto loop = scf::ForOp::create(
+            b, loc, zero, bounds[dim], one, carried,
+            [&](OpBuilder &body, Location bodyLoc, Value iv, ValueRange args) {
+              indices.push_back(iv);
+              auto values = nest(body, dim + 1, args);
+              indices.pop_back();
+              scf::YieldOp::create(body, bodyLoc, values);
+            });
+        return SmallVector<Value>(loop.getResults());
+      }
+
+      SmallVector<Value> accIndices;
+      for (unsigned index = 0; index < indices.size(); ++index)
+        if (index != scanDim)
+          accIndices.push_back(indices[index]);
+      Value first = arith::CmpIOp::create(
+          b, loc, arith::CmpIPredicate::eq, indices[scanDim], zero);
+      auto branch = scf::IfOp::create(b, loc, carried.getTypes(), first, true);
+      {
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(&branch.getThenRegion().front());
+        Value initial = op.getInclusive()
+            ? tensor::ExtractOp::create(b, loc, op.getInput(), indices).getResult()
+            : tensor::ExtractOp::create(b, loc, carried[1], accIndices).getResult();
+        Value output = tensor::InsertOp::create(b, loc, initial, carried[0], indices);
+        scf::YieldOp::create(b, loc, ValueRange{output, carried[1]});
+      }
+      {
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(&branch.getElseRegion().front());
+        SmallVector<Value> previousIndices(indices);
+        previousIndices[scanDim] = arith::SubIOp::create(b, loc, indices[scanDim], one);
+        Value previous = tensor::ExtractOp::create(b, loc, carried[0], previousIndices);
+        Value current = tensor::ExtractOp::create(
+            b, loc, op.getInput(), op.getInclusive() ? indices : previousIndices);
+        IRMapping mapping;
+        Block &source = op.getRegion().front();
+        mapping.map(source.getArgument(0), previous);
+        mapping.map(source.getArgument(1), current);
+        for (Operation &operation : source.without_terminator())
+          b.clone(operation, mapping);
+        Value combined = mapping.lookupOrDefault(source.getTerminator()->getOperand(0));
+        Value output = tensor::InsertOp::create(b, loc, combined, carried[0], indices);
+        Value accumulator = tensor::InsertOp::create(b, loc, combined, carried[1], accIndices);
+        scf::YieldOp::create(b, loc, ValueRange{output, accumulator});
+      }
+      return SmallVector<Value>(branch.getResults());
+    };
+    auto results = nest(rewriter, 0, ValueRange{op.getOutput(), op.getAccumulator()});
+    rewriter.replaceOp(op, results);
+    return success();
+  }
 };
 
 // Pattern to lower tm_tensor.attention to linalg operations
@@ -236,7 +314,7 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
 
 void HexagonLowerTmTensorPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
-  patterns.add<LowerAttentionOp>(patterns.getContext());
+  patterns.add<LowerAttentionOp, LowerScanOp, LowerScatterOp>(patterns.getContext());
 
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
     signalPassFailure();

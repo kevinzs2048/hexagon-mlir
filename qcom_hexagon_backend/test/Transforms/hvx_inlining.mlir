@@ -1,5 +1,6 @@
-// RUN: linalg-hexagon-translate %s --enable-hvx-inlining=false | FileCheck %s --check-prefix=CHECK-NO-INLINE
-// RUN: linalg-hexagon-translate %s --enable-hvx-inlining=true | FileCheck %s --check-prefix=CHECK-INLINE
+// RUN: env HEXAGON_ARCH_VERSION=73 linalg-hexagon-translate %s --enable-hvx-inlining=false | FileCheck %s --check-prefix=CHECK-NO-INLINE
+// RUN: env HEXAGON_ARCH_VERSION=73 linalg-hexagon-translate %s --enable-hvx-inlining=true | FileCheck %s --check-prefix=CHECK-NO-INLINE
+// RUN: env HEXAGON_ARCH_VERSION=73 linalg-hexagon-translate %s --enable-hvx-inlining=true -features=+hvxv73,+hvx-length128b,+hvx-qfloat | FileCheck %s --check-prefix=CHECK-INLINE
 
 // When inlining is disabled, we should see calls to _hexagon_runtime_* functions
 // CHECK-NO-INLINE: call <32 x i32> @_hexagon_runtime_exp__vf
@@ -26,7 +27,8 @@
 // CHECK-NO-INLINE: call <32 x i32> @_hexagon_runtime_pow__vf
 // CHECK-NO-INLINE: call <32 x i32> @_hexagon_runtime_pow__vhf
 
-// When inlining is enabled, the runtime functions should be inlined and we shouldn't see the calls
+// Compatible QFloat callers may inline. IEEE v73 callers retain the runtime
+// call boundary even when inlining is requested, preserving callee features.
 // CHECK-INLINE-NOT: call {{.*}} @_hexagon_runtime_exp__vf
 // CHECK-INLINE-NOT: call {{.*}} @_hexagon_runtime_sin__vf
 // CHECK-INLINE-NOT: call {{.*}} @_hexagon_runtime_cos__vf

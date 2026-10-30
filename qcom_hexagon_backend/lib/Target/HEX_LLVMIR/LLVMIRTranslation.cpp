@@ -11,6 +11,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Target/HEX_LLVMIR/LLVMIRTranslation.h"
+#include "hexagon/Target/HEX_LLVMIR/FloatingPointFeatures.h"
+#include "hexagon/Target/HEX_LLVMIR/RuntimeInliningPolicy.h"
+#include "hexagon/Target/HEX_LLVMIR/CheckedScalarExponential.h"
+#include "hexagon/Target/HEX_LLVMIR/OutlineVectorMinMax.h"
+#include "hexagon/Target/HEX_LLVMIR/LLVMOptimizationProgress.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
@@ -19,6 +24,9 @@
 #include "mlir/Target/LLVMIR/Export.h"
 
 #include "hexagon/Common/Common.h"
+#include "llvm/IR/PassTimingInfo.h"
+#include "llvm/Pass.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "llvm/ADT/SmallVector.h"
@@ -43,6 +51,7 @@ namespace hexagon {
 
 void cond_run_inliner(std::unique_ptr<llvm::Module> &llvmModule,
                       bool enableInlining) {
+  protectHexagonFloatingPointCallBoundaries(*llvmModule);
   if (enableInlining) {
     llvm::PassRegistry *registry = llvm::PassRegistry::getPassRegistry();
     initializeAlwaysInlinerLegacyPassPass(*registry);
@@ -196,6 +205,8 @@ runLLVMOptimizer(unsigned optLevel, unsigned sizeLevel,
     llvm::PassInstrumentationCallbacks pic;
     llvm::StandardInstrumentations si(m->getContext(), /*DebugLogging=*/false);
     si.registerCallbacks(pic, &mam);
+    if (isEnvTrue("HEXAGON_LLVM_PASS_PROGRESS"))
+      registerLLVMOptimizationProgress(pic);
 
     // Register custom callbacks to print IR after each pass if env var is set
     const char *dumpPasses = std::getenv("HEXAGON_LLVM_PASSES_DUMP");
@@ -247,8 +258,27 @@ static std::unique_ptr<llvm::Module> translateLLVMToLLVMIR(
   }
   llvmModule->setTargetTriple(llvm::Triple(arch_kwargs.at("arch_triple")));
   llvmModule->setDataLayout(arch_kwargs.at("data_layout"));
-  for (llvm::Function &f : llvmModule->functions())
-    f.addFnAttr("target-features", arch_kwargs.at("arch_features"));
+  bool enableHexagonBitCopyGeneration = true;
+  if (auto it = arch_kwargs.find("enableHexagonBitCopyGeneration");
+      it != arch_kwargs.end())
+    enableHexagonBitCopyGeneration = it->second == "True";
+
+  for (llvm::Function &f : llvmModule->functions()) {
+    f.addFnAttr("target-features", resolveHexagonFloatingPointFeatures(
+                                       arch_kwargs.at("arch_features")));
+    if (!enableHexagonBitCopyGeneration)
+      f.addFnAttr("hexagon-no-bit-copy-generation");
+    if (auto it = arch_kwargs.find("enableHexagonGenInsert");
+        it != arch_kwargs.end() && it->second == "False")
+      f.addFnAttr("hexagon-no-gen-insert");
+  }
+
+  auto outlineExp = arch_kwargs.find("outlineCheckedVectorExp");
+  useCheckedScalarExponential(*llvmModule,
+      outlineExp != arch_kwargs.end() && outlineExp->second == "True");
+  if (auto it = arch_kwargs.find("outlineVectorMinMax");
+      it != arch_kwargs.end() && it->second == "True")
+    outlineVectorMinMax(*llvmModule);
 
   if (optLevel != LLVMOptimizationLevel::NoOptimization) {
     auto optPipeline = runLLVMOptimizer(
@@ -377,6 +407,14 @@ llvm_module_to_obj_string(std::unique_ptr<llvm::Module> &llvmModule) {
   initializeHexagonTarget();
 
   auto target_triple = llvmModule->getTargetTriple();
+  // Optional diagnostics for large-model codegen. Python entry points hold the
+  // GIL during compilation; restore LLVM's process-wide flag on exit.
+  const bool timingRequested = isEnvTrue("HEXAGON_CODEGEN_TIMING");
+  const bool previousTiming = llvm::TimePassesIsEnabled;
+  auto restoreTiming = llvm::make_scope_exit(
+      [&] { llvm::TimePassesIsEnabled = previousTiming; });
+  if (timingRequested)
+    llvm::TimePassesIsEnabled = true;
 
   std::unique_ptr<llvm::TargetMachine> targetMachine =
       create_target_machine(target_triple);
@@ -395,6 +433,8 @@ llvm_module_to_obj_string(std::unique_ptr<llvm::Module> &llvmModule) {
     llvm::errs() << "Error while emitting target code. \n";
 
   codegenPasses.run(*llvmModule);
+  if (timingRequested)
+    llvm::reportAndResetTimings(&llvm::errs());
 
   // Once the pass runs and the value is populated in the SmallVector,
   // the data is dumped to obj_bc (vector<char>).

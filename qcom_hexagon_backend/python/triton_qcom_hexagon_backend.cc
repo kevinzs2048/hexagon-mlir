@@ -8,6 +8,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "triton_qcom_hexagon_backend_api.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
+#include <optional>
 
 #define DEBUG_TYPE "triton-qcom-hexagon-backend"
 
@@ -15,6 +18,45 @@
 #define DBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace py = pybind11;
+
+namespace {
+// Python bindings retain the GIL. This policy belongs to a fresh compilation
+// worker: LLVM's target switch is process-wide, not a per-function setting.
+std::optional<bool> processGenInsert;
+bool translationStarted = false;
+
+void configureProcessGenInsert(bool enabled) {
+  if (translationStarted)
+    throw py::value_error("Configure process codegen before translation starts");
+  if (processGenInsert) {
+    if (*processGenInsert != enabled)
+      throw py::value_error("Use a fresh process to change the codegen policy");
+    return;
+  }
+  auto &options = llvm::cl::getRegisteredOptions();
+  auto found = options.find("hexagon-insert");
+  if (found == options.end())
+    throw py::value_error("LLVM does not provide the hexagon-insert option");
+  if (found->second->getNumOccurrences())
+    throw py::value_error("LLVM hexagon-insert was already configured");
+  const char *argv[] = {"hexagon-aot-worker", enabled ? "-hexagon-insert=true"
+                                                   : "-hexagon-insert=false"};
+  std::string error;
+  llvm::raw_string_ostream stream(error);
+  if (!llvm::cl::ParseCommandLineOptions(2, argv, "", &stream))
+    throw py::value_error("Could not configure LLVM codegen: " + stream.str());
+  processGenInsert = enabled;
+}
+
+void startTranslation(
+    const std::unordered_map<std::string, std::string> &options) {
+  auto found = options.find("enableHexagonGenInsert");
+  if (processGenInsert && found != options.end() && found->second == "False")
+    throw py::value_error(
+        "Process codegen policy cannot be combined with a function opt-out");
+  translationStarted = true;
+}
+} // namespace
 
 namespace pybind11 {
 namespace detail {
@@ -52,6 +94,11 @@ void fill_options_map(
 void init_triton_hexagon_translation(py::module &m) {
   using ret = py::return_value_policy;
 
+  m.def("configure_process_geninsert", &configureProcessGenInsert,
+        py::arg("enabled").noconvert(),
+        "Set the official LLVM GenInsert option once in a fresh AOT worker. "
+        "The setting is process-wide and cannot change after translation.");
+
   m.def("get_return_list", [](mlir::ModuleOp &module_op, std::string fName) {
     return hexagon_backend::getReturnList(module_op, fName);
   });
@@ -83,6 +130,7 @@ void init_triton_hexagon_translation(py::module &m) {
       [](mlir::ModuleOp &linalg_module, py::dict arch_kwargs) {
         std::unordered_map<std::string, std::string> options_map;
         fill_options_map(arch_kwargs, options_map);
+        startTranslation(options_map);
         return hexagon_backend::translateLinalgToLLVMIR(linalg_module,
                                                         options_map);
       },
@@ -101,6 +149,7 @@ void init_triton_hexagon_translation(py::module &m) {
         // Goes from a py::dict (arch_kwargs) mapping python strings to python
         // strings to a C++ mapping of strings to strings
         fill_options_map(arch_kwargs, options_map);
+        startTranslation(options_map);
         return hexagon_backend::translateLinalgToObj(linalg_module,
                                                      options_map);
       },

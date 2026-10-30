@@ -45,9 +45,17 @@ class HexagonOptions:
     iterations: int = 10  # Triton specific benchmarking iteration count
 
     # Hexagon Linalg Options
+    # Experimental DSP-internal calls, not additional host/DSP RPC calls.
+    # Off by default: call boundaries can inhibit fusion and affect runtime.
+    outlineMatmul: bool = False
+    tileOutlinedMatmul: bool = False  # Experimental DDR cache tiling for outlined W8A8 matmuls
     fusion: bool = True
     fusionAllowRecompute: bool = False
     fusionDoMultiUse: bool = True
+    # Disable unrequested reassociation and other LLVM `fast` assumptions.
+    # HVX instruction precision is a separate policy: LLVM translation selects
+    # IEEE by default on v73 unless arch_features explicitly selects FP mode.
+    addFastMath: bool = False
 
     enableBufferization: bool = True  # Used to disable for some dma testing
     enableCollapseAddressSpace: bool = True  # lower llvm.ptr<1> if hexagonmem did not
@@ -57,6 +65,18 @@ class HexagonOptions:
     enableConvertToHexagonmem: bool = True  # rewrites memref.alloc/copy to hexagonmem.*
     enableHexagonmemCopyToDMA: bool = False  # rewrites hexmem.copy to memref.dma_*
     enableHexKL: bool = False  # use HexKL to lower matmul and convolutions
+    enableHexagonRoutines: bool = True  # use optimized f16/f32 math routines
+    # Disable only the affected LLVM BitSimplify subphase when compiling a
+    # model function that triggers Hexagon CopyGeneration miscompilation.
+    enableHexagonBitCopyGeneration: bool = True
+    # Opt-in DSP-local reuse of the existing checked vector-exp scalarization.
+    # Does not change exp math or add a host/device dispatch boundary.
+    outlineCheckedVectorExp: bool = False
+    # Optional reuse of the exact LLVM FP32 vector min/max reduction intrinsic.
+    outlineVectorMinMax: bool = False
+    # Optional compile-time tradeoff for large functions; does not disable HVX
+    # vector insertion or change numerical precision. Default LLVM policy stays on.
+    enableHexagonGenInsert: bool = True
     hexKLMode: str = "micro"  # possible options "macro", "micro"
     enableMultiThreading: bool = (
         False  # linalg-generic based multi-threading (FormVirtualThreadsPass)
@@ -91,6 +111,10 @@ class HexagonOptions:
 
     # Separate out constants (dense_resource) into separate shared objects
     lowerConstantsInSeparateSharedObjects: bool = False
+    # Opt-in packaging for the torch-mlir multi-object path. Keep private
+    # assertion diagnostics in the code module so they do not perturb shared
+    # model-weight libraries. Does not remove assertions or change arithmetic.
+    keepAssertMessagesInMain: bool = False
 
     # light weight profiling using hardware instructions
     enableLWP: bool = False
@@ -107,6 +131,12 @@ class HexagonOptions:
     deviceCleanup: bool = True
 
     def __post_init__(self):
+        if type(self.keepAssertMessagesInMain) is not bool:
+            raise ValueError("keepAssertMessagesInMain must be a bool")
+        if self.keepAssertMessagesInMain and self.lowerConstantsInSeparateSharedObjects is not True:
+            raise ValueError(
+                "keepAssertMessagesInMain requires lowerConstantsInSeparateSharedObjects"
+            )
         # Validate target_artifact
         valid_artifacts = {"ttir", "ttsharedir", "llir", "o", "so"}
         if self.target_artifact not in valid_artifacts:

@@ -63,11 +63,7 @@ static void doVectorLowering(ModuleOp moduleOp) {
   vector::populateScalarVectorTransferLoweringPatterns(
       patterns, /*benefit=*/1, /*allowMultipleUses=*/true);
   vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
-  vector::populateVectorMultiReductionReorderPatterns(
-      patterns, vectorMultiReductionLowering);
-  vector::populateVectorMultiReductionFlatteningPatterns(
-      patterns, vectorMultiReductionLowering);
-  vector::populateVectorMultiReductionUnrollingPatterns(
+  vector::populateVectorMultiReductionLoweringPatterns(
       patterns, vectorMultiReductionLowering);
   populateVectorTransferFullPartialPatterns(patterns, vectorTransformOptions);
   FrozenRewritePatternSet frozenPatterns = std::move(patterns);

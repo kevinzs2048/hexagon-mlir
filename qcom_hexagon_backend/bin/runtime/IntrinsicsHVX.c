@@ -14,6 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon_types.h"
+#include "include/ExpRangeReduction.h"
 #include "internal/hvx_internal.h"
 #include "internal/qhmath_hvx_convert.h"
 #include "internal/qhmath_hvx_vector.h"
@@ -58,7 +59,9 @@
 // Exponential
 //===----------------------------------------------------------------------===//
 
-MAP_MLIR_TO_QHMATH_SINGLE_ARG(exp, vf);
+HEXAGON_INTRIN_INLINE HVX_Vector _hexagon_runtime_exp__vf(HVX_Vector vin) {
+  return hexagon_exp_f32_checked(vin, qhmath_hvx_exp_vf);
+}
 MAP_MLIR_TO_QHMATH_SINGLE_ARG(exp, vhf);
 
 //===----------------------------------------------------------------------===//

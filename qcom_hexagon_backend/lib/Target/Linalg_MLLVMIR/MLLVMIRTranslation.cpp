@@ -59,10 +59,15 @@ void setLinalgToLLVMOptions(
   // when the strings are actually equal, which is why we negate it to convert
   // it to a boolean.
   const std::string TRUE("True");
+  if (auto it = arch_kwargs.find("outlineMatmul"); it != arch_kwargs.end())
+    options.outlineMatmul = it->second == TRUE;
+  if (auto it = arch_kwargs.find("tileOutlinedMatmul"); it != arch_kwargs.end())
+    options.tileOutlinedMatmul = it->second == TRUE;
   options.fusion = !arch_kwargs.at("fusion").compare(TRUE);
   options.fusionAllowRecompute =
       !arch_kwargs.at("fusionAllowRecompute").compare(TRUE);
   options.fusionDoMultiUse = !arch_kwargs.at("fusionDoMultiUse").compare(TRUE);
+  options.addFastMath = !arch_kwargs.at("addFastMath").compare(TRUE);
   options.enableDoubleBuffering =
       !arch_kwargs.at("enableDoubleBuffering").compare(TRUE);
   options.enableSCFThreading =
@@ -76,6 +81,8 @@ void setLinalgToLLVMOptions(
   options.enableHexagonmemCopyToDMA =
       !arch_kwargs.at("enableHexagonmemCopyToDMA").compare(TRUE);
   options.enableHexKL = !arch_kwargs.at("enableHexKL").compare(TRUE);
+  options.enableHexagonRoutines =
+      !arch_kwargs.at("enableHexagonRoutines").compare(TRUE);
   options.hexKLMode = arch_kwargs.at("hexKLMode");
   options.enableCollapseAddressSpace =
       !arch_kwargs.at("enableCollapseAddressSpace").compare(TRUE);
@@ -200,6 +207,24 @@ public:
 std::vector<ModuleOp> translateLinalgToMultipleLLVMMLIRModules(
     ModuleOp mod,
     const std::unordered_map<std::string, std::string> &arch_kwargs) {
+
+  // Optional packaging policy, independent of arithmetic lowering. Keep the
+  // default artifact layout unchanged for callers that do not request it.
+  auto keepMessages = arch_kwargs.find("keepAssertMessagesInMain");
+  if (keepMessages != arch_kwargs.end()) {
+    if (keepMessages->second != "True" && keepMessages->second != "False") {
+      mod.emitError("keepAssertMessagesInMain must be True or False");
+      return {};
+    }
+    if (keepMessages->second == "True") {
+      mod->setAttr(LowerConstantsSeparatelyPass::keepAssertMessagesAttr,
+                   UnitAttr::get(mod.getContext()));
+    } else if (mod->hasAttr(
+                   LowerConstantsSeparatelyPass::keepAssertMessagesAttr)) {
+      mod.emitError("False packaging option conflicts with module retention attribute");
+      return {};
+    }
+  }
 
   LinalgToLLVMOptions options;
   setLinalgToLLVMOptions(options, arch_kwargs);

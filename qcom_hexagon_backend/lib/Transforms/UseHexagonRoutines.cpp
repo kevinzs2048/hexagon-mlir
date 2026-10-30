@@ -23,7 +23,6 @@
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
-#include <type_traits>
 
 #define DEBUG_TYPE "hexagon-llvm-use-hexagon-routines"
 
@@ -102,7 +101,7 @@ static FailureOr<std::string> LLVMOpToHexagonRountineName(const Operation *op) {
 }
 
 // Generate suffix for an operand type.
-static std::string getSuffix(Type t) {
+static FailureOr<std::string> getSuffix(Type t) {
   std::string suffix = "";
   if (isa<VectorType>(t)) {
     suffix += "v";
@@ -114,15 +113,19 @@ static std::string getSuffix(Type t) {
   else if (elemType.isF32())
     suffix += "f";
   else
-    llvm_unreachable("Expecting only F16 or F32 type!");
+    return failure();
   return suffix;
 }
 
 // Generate suffix for each operand type in the opertion.
-static std::string getSuffix(Operation *op) {
+static FailureOr<std::string> getSuffix(Operation *op) {
   std::string suffix = "";
-  for (const auto &operandType : op->getOperandTypes())
-    suffix += getSuffix(operandType);
+  for (const auto &operandType : op->getOperandTypes()) {
+    FailureOr<std::string> operandSuffix = getSuffix(operandType);
+    if (failed(operandSuffix))
+      return failure();
+    suffix += operandSuffix.value();
+  }
   return suffix;
 }
 
@@ -132,7 +135,10 @@ static FailureOr<std::string> getFnName(Operation *op) {
   FailureOr<std::string> fnName = LLVMOpToHexagonRountineName(op);
   if (failed(fnName))
     return failure();
-  return "_hexagon_runtime_" + fnName.value() + "__" + getSuffix(op);
+  FailureOr<std::string> suffix = getSuffix(op);
+  if (failed(suffix))
+    return failure();
+  return "_hexagon_runtime_" + fnName.value() + "__" + suffix.value();
 }
 
 static std::optional<std::pair<Type, unsigned>>
@@ -355,9 +361,10 @@ public:
     if (!isConstantOne(numerator))
       return failure();
 
-    // Approximate rsqrt does not preserve strict sqrt-then-divide rounding.
-    // Both operations must permit approximation, for scalars and vectors.
-    if (getElementType(resultType).isF32() &&
+    // Neither scalar nor vector reciprocal-sqrt routines preserve the strict
+    // FP32 sqrt-then-divide rounding contract. Check before either rewrite;
+    // a scalar call must not bypass the same policy as its vector equivalent.
+    if (getElementType(fdivOp.getType()).isF32() &&
         (fdivOp.getFastmathFlags() != LLVM::FastmathFlags::fast ||
          sqrtOp.getFastmathFlags() != LLVM::FastmathFlags::fast))
       return failure();
@@ -461,22 +468,38 @@ public:
 
   LogicalResult matchAndRewrite(LLVMOp op,
                                 PatternRewriter &rewriter) const override {
-    // Keep strict FP32 sqrt available for generic lowering. Otherwise this
-    // pattern could bypass the reciprocal-sqrt guard by rewriting sqrt alone.
-    if constexpr (std::is_same_v<LLVMOp, LLVM::SqrtOp>) {
-      if (getElementType(op.getType()).isF32() &&
-          op.getFastmathFlags() != LLVM::FastmathFlags::fast)
-        return failure();
-    }
-
     // Check if we have custom Hexagon implementation for this routine.
     // Only process ops with native vector( or size that is factor of native
     // vector width) operands and results and with #results and #operands == 1.
-    FailureOr<std::string> fnName = getFnName(op);
-    if (failed(fnName) || op->getNumResults() != 1 ||
-        op->getNumOperands() != 1 || !allNativeVectorFactorTypes(op)) {
+    // Check the arity and types before building the runtime symbol name.
+    // getFnName() intentionally only understands the f16/f32 routines that
+    // exist in the Hexagon runtime.  Calling it first made an otherwise legal
+    // intrinsic with a different element type (notably bf16) hit
+    // llvm_unreachable() instead of simply being left for generic lowering.
+    if (op->getNumResults() != 1 || op->getNumOperands() != 1 ||
+        !allNativeVectorFactorTypes(op)) {
       return failure();
     }
+
+    // These FP32 routines use approximate arithmetic, including Qfloat on
+    // older HVX targets. Besides sqrt special values, exp can move a BF16
+    // rounding boundary and the trig range reduction can choose a wrong sign.
+    // Do not introduce those approximations into strict LLVM intrinsics.
+    // The explicit full-fast path and other routines/FP16 remain unchanged.
+    bool requiresStrictLowering =
+        TypeSwitch<Operation *, bool>(op.getOperation())
+            .Case<LLVM::SqrtOp, LLVM::ExpOp, LLVM::SinOp, LLVM::CosOp>(
+                [](auto mathOp) {
+                  return getElementType(mathOp.getType()).isF32() &&
+                         mathOp.getFastmathFlags() != LLVM::FastmathFlags::fast;
+                })
+            .Default(false);
+    if (requiresStrictLowering)
+      return failure();
+
+    FailureOr<std::string> fnName = getFnName(op);
+    if (failed(fnName))
+      return failure();
 
     auto returnTyElementInfo = getVectorElementInfo(op->getResult(0).getType());
     auto operandTyElementInfo =

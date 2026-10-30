@@ -29,16 +29,20 @@ message ("MULTITHREADING: cmake cxx compiler : ${CMAKE_CXX_COMPILER}")
 message(STATUS "Building MLIR AsyncRuntime package") 
 
 
-set(LLVM_ROOT_DIR $ENV{LLVM_SYSPATH})
+if(LLVM_SYSPATH)
+    set(LLVM_ROOT_DIR "${LLVM_SYSPATH}")
+else()
+    set(LLVM_ROOT_DIR "$ENV{LLVM_SYSPATH}")
+endif()
 
 if(LLVM_ROOT_DIR)
-  get_filename_component(LLVM_ROOT ${LLVM_ROOT_DIR} DIRECTORY)
+  get_filename_component(LLVM_ROOT "${LLVM_ROOT_DIR}" DIRECTORY)
 endif()
 
 set(HEXAGON_SDK_ROOT $ENV{HEXAGON_SDK_ROOT})
 
 if(NOT DEFINED LLVM_ROOT OR NOT LLVM_ROOT)
-    message(FATAL_ERROR "LLVM_ROOT not set. Set LLVM_SYSPATH env var.")
+    message(FATAL_ERROR "LLVM_SYSPATH must be set as a CMake variable or in the environment.")
 endif()
 
 # Include directories for QURT libraries

@@ -64,29 +64,28 @@ void mlir::tptr::HexagonTPtrDialect::initialize() {
 
 bool tptr::HexagonDefaultMemorySpaceAttr::isValidLoad(
     Type type, mlir::ptr::AtomicOrdering ordering,
-    std::optional<int64_t> alignment, const ::mlir::DataLayout *dataLayout,
+    IntegerAttr alignment,
     function_ref<InFlightDiagnostic()> emitError) const {
   return true;
 }
 
 bool tptr::HexagonDefaultMemorySpaceAttr::isValidStore(
     Type type, mlir::ptr::AtomicOrdering ordering,
-    std::optional<int64_t> alignment, const ::mlir::DataLayout *dataLayout,
+    IntegerAttr alignment,
     llvm::function_ref<InFlightDiagnostic()> emitError) const {
   return true;
 }
 
 bool tptr::HexagonDefaultMemorySpaceAttr::isValidAtomicOp(
     mlir::ptr::AtomicBinOp binOp, Type type, mlir::ptr::AtomicOrdering ordering,
-    std::optional<int64_t> alignment, const ::mlir::DataLayout *dataLayout,
+    IntegerAttr alignment,
     llvm::function_ref<InFlightDiagnostic()> emitError) const {
   return true;
 }
 
 bool tptr::HexagonDefaultMemorySpaceAttr::isValidAtomicXchg(
     Type type, mlir::ptr::AtomicOrdering successOrdering,
-    mlir::ptr::AtomicOrdering failureOrdering, std::optional<int64_t> alignment,
-    const ::mlir::DataLayout *dataLayout,
+    mlir::ptr::AtomicOrdering failureOrdering, IntegerAttr alignment,
     function_ref<InFlightDiagnostic()> emitError) const {
   return true;
 }

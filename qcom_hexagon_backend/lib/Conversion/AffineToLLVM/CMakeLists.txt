@@ -10,6 +10,11 @@ add_mlir_conversion_library(AffineToLLVM
 
   DEPENDS
   AffineToLLVMConversionPassIncGen
+  DMAToLLVMConversionPassIncGen
+  HexagonMemToLLVMConversionPassIncGen
+  LinalgToLLVMConversionPassIncGen
+  TransformsPassIncGen
+  HexagonMemTableGen
 
   LINK_COMPONENTS
   Core

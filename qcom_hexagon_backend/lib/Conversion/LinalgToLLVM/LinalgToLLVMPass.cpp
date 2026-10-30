@@ -16,6 +16,8 @@
 #include "hexagon/Conversion/HexagonMemToLLVM/Passes.h"
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
+#include "hexagon/Conversion/LinalgToLLVM/FoldConstantTransposes.h"
+#include "hexagon/Conversion/LinalgToLLVM/HoistVectorTransferScratch.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
 #include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
@@ -27,7 +29,7 @@
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Affine/Transforms/Passes.h"
+#include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/Async/Passes.h"
@@ -45,9 +47,14 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassInstrumentation.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/TargetParser/Triple.h"
+
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
 
 #define DEBUG_TYPE "linalg-to-llvm"
 
@@ -61,6 +68,34 @@ using namespace hexagon;
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h.inc"
 
 namespace {
+
+// Opt-in progress without dumping model constants or entire operations.
+class LoweringProgress : public PassInstrumentation {
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  std::mutex mutex;
+
+  void report(StringRef event, Pass *pass, Operation *op) {
+    std::lock_guard<std::mutex> lock(mutex);
+    double elapsed = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - start).count();
+    llvm::errs() << "[hexmlir-pass] " << elapsed << "s: " << event << " "
+                 << pass->getName() << " on " << op->getName().getStringRef();
+    if (auto name = op->getAttrOfType<StringAttr>("sym_name"))
+      llvm::errs() << " @" << name.getValue();
+    llvm::errs() << "\n";
+  }
+
+public:
+  void runBeforePass(Pass *pass, Operation *op) override {
+    report("begin", pass, op);
+  }
+  void runAfterPass(Pass *pass, Operation *op) override {
+    report("end", pass, op);
+  }
+  void runAfterPassFailed(Pass *pass, Operation *op) override {
+    report("failed", pass, op);
+  }
+};
 
 struct LinalgToLLVMPass : public ::impl::LinalgToLLVMBase<LinalgToLLVMPass> {
 public:
@@ -162,6 +197,12 @@ public:
     };
 
     PassManager pm(&getContext(), moduleOp.getOperationName());
+    const char *trace = std::getenv("HEXAGON_MLIR_PROGRESS");
+    if (trace && (StringRef(trace) == "true" || StringRef(trace) == "1")) {
+      // runPipeline uses the parent instrumentor, not the local PM's.
+      if (auto *instrumentor = getAnalysisManager().getPassInstrumentor())
+        instrumentor->addInstrumentation(std::make_unique<LoweringProgress>());
+    }
 
     // RequestCWrappersPass adds an attribute to a function if it has a return
     // value which would generate a c-wrapper function during the
@@ -218,8 +259,10 @@ public:
 
     pm.addNestedPass<func::FuncOp>(createOptimizeExtfTruncfOpPass());
 
-    // Optimize division to multiplication in linalg.generic
-    pm.addNestedPass<func::FuncOp>(createDivToMulOptimizationPass());
+    // Reciprocal multiplication changes rounding even without fast-math
+    // attributes on the new operations. Honor the pipeline opt-out.
+    if (addFastMath)
+      pm.addNestedPass<func::FuncOp>(createDivToMulOptimizationPass());
 
     // Quantization related passes in this block
     // Lower quant.qcast and quant.dcast ops to arith dialect
@@ -262,6 +305,14 @@ public:
       pm.addNestedPass<func::FuncOp>(createPreprocessTiledConv2DPass());
     }
 
+    pm.addPass(std::make_unique<mlir::hexagon::FoldConstantTransposesPass>());
+    pm.addPass(createCanonicalizerPass());
+    if (tileOutlinedMatmul && !outlineMatmul) {
+      moduleOp.emitError("tile-outlined-matmul requires outline-matmul");
+      return signalPassFailure();
+    }
+    if (outlineMatmul)
+      pm.addPass(createOutlineMatmulPass(tileOutlinedMatmul));
     pm.addNestedPass<func::FuncOp>(createScheduleMatmulForHVXPass());
     pm.addNestedPass<func::FuncOp>(createLinalgGeneralizePass());
 
@@ -323,6 +374,12 @@ public:
 
     pm.addPass(removeMLProgramPass());
     pm.addPass(createLinalgFoldUnitExtentDimsPass());
+    // Fused RMSNorm still contains fpowi(x, 2) here. Normalize it before
+    // split-reduction admission, not only after tiling. Keep the default
+    // pipeline unchanged when the explicitly opt-in reduction policy is off.
+    if (enableVectorization && enableSplitReduction)
+      pm.addPass(
+          createSmallExponentToMultiplyPass(SmallExponentToMultiplyOptions{}));
     if (enableVectorization) {
       pm.addPass(
           createHexagonTilingPass(setsplitTilingRange(setuseInterchangeVector(
@@ -376,6 +433,13 @@ public:
       mlir::bufferization::OneShotBufferizePassOptions passOpts;
       passOpts.bufferizeFunctionBoundaries = true;
       passOpts.allowReturnAllocsFromLoops = true;
+      if (outlineMatmul) {
+        // Preserve contiguous transfers inside DSP-local helpers. Dynamic
+        // signature strides otherwise force lane-by-lane vector construction.
+        // Bufferization inserts a copy when an actual argument is noncontiguous.
+        passOpts.functionBoundaryTypeConversion =
+            bufferization::LayoutMapOption::IdentityLayoutMap;
+      }
       pm.addPass(bufferization::createOneShotBufferizePass(passOpts));
       pm.addPass(createCSEPass());
       pm.addPass(createCanonicalizerPass());
@@ -444,6 +508,12 @@ public:
     pm.addPass(createAsyncToAsyncRuntimePass());
 
     pm.addNestedPass<func::FuncOp>(createConvertVectorToSCFPass());
+    // Vector transfer lowering creates new stack temporaries after the earlier
+    // buffer-hoisting stage. Move eligible vector stack temporaries out of sequential loops
+    // before SCF scopes disappear: otherwise LLVM alloca executes on every
+    // iteration and accumulates until function return (6 MiB per Qwen MLP
+    // projection in the observed batch-one BF16 decode).
+    pm.addNestedPass<func::FuncOp>(createHoistVectorTransferScratchPass());
 
     if (enableLWP)
       pm.addNestedPass<func::FuncOp>(
@@ -459,7 +529,9 @@ public:
     if (expandBoolVec)
       pm.addNestedPass<func::FuncOp>(createExpandBoolVecPass());
 
-    pm.addPass(createFastInversePass());
+    // Omitting fast-math attributes does not undo an approximate reciprocal.
+    if (addFastMath)
+      pm.addPass(createFastInversePass());
     pm.addPass(createConvertVectorToLLVMPass());
     pm.addPass(createConvertIndexToLLVMPass(
         setIndexBitwidth(ConvertIndexToLLVMPassOptions{})));
@@ -479,6 +551,10 @@ public:
 
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(createArithToLLVMConversionPass());
+    // Vector/shape lowering may retain poison values for inactive lanes (e.g.
+    // cached single-token decode). Preserve poison semantics while converting
+    // the remaining UB dialect; LLVM IR export cannot translate ub.poison.
+    pm.addPass(createUBToLLVMConversionPass());
     pm.addPass(createConvertControlFlowToLLVMPass());
 
     pm.addPass(createCanonicalizerPass());

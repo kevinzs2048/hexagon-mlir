@@ -4,6 +4,8 @@ add_mlir_conversion_library(HexKLToLLVM
 
   DEPENDS
   HexKLToLLVMConversionPassIncGen
+  LinalgToLLVMConversionPassIncGen
+  HexKLTableGen
 
   LINK_COMPONENTS
   Core
